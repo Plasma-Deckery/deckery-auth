@@ -85,6 +85,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deckery-pam-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+]
+
+[[package]]
 name = "deckery-pin-set"
 version = "0.1.0"
 dependencies = [

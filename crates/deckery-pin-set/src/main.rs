@@ -4,6 +4,7 @@ use argon2::{
     Argon2, Params, Version,
 };
 use std::fs;
+use std::io::{self, BufRead};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -25,16 +26,36 @@ fn main() -> Result<()> {
         bail!("deckery-pin-set must be run as root (use sudo)");
     }
 
-    println!("Deckery — controller PIN setup");
-    println!("This PIN is used to authenticate sudo, polkit, and the lock screen");
-    println!("via pam_deckery. It is independent of your login password.\n");
+    let stdin_mode = std::env::args().any(|a| a == "--stdin");
 
-    let pin = rpassword::prompt_password("Enter new PIN: ").context("failed to read PIN")?;
-    let confirm = rpassword::prompt_password("Confirm PIN: ").context("failed to read PIN")?;
+    let pin = if stdin_mode {
+        // Non-interactive mode for automated testing via deploy.sh.
+        // Reads a single line from stdin — no TTY required.
+        // Do not use in production; the PIN is visible to anyone who can
+        // inspect the process's stdin (e.g. via /proc), which is acceptable
+        // only because the caller already has root.
+        let mut line = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("failed to read PIN from stdin")?;
+        line.trim_end_matches('\n').trim_end_matches('\r').to_owned()
+    } else {
+        println!("Deckery — controller PIN setup");
+        println!("This PIN is used to authenticate sudo, polkit, and the lock screen");
+        println!("via pam_deckery. It is independent of your login password.\n");
 
-    if pin != confirm {
-        bail!("PINs did not match — aborting");
-    }
+        let pin =
+            rpassword::prompt_password("Enter new PIN: ").context("failed to read PIN")?;
+        let confirm =
+            rpassword::prompt_password("Confirm PIN: ").context("failed to read PIN")?;
+
+        if pin != confirm {
+            bail!("PINs did not match — aborting");
+        }
+        pin
+    };
+
     if pin.trim().is_empty() {
         bail!("PIN must not be empty");
     }
@@ -45,7 +66,9 @@ fn main() -> Result<()> {
     let hash = hash_pin(&pin)?;
     write_hash(&hash)?;
 
-    println!("\nPIN set. Stored (hashed) at {PIN_HASH_PATH}");
+    if !stdin_mode {
+        println!("\nPIN set. Stored (hashed) at {PIN_HASH_PATH}");
+    }
     Ok(())
 }
 

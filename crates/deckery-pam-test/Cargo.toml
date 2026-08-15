@@ -1,0 +1,15 @@
+[package]
+name = "deckery-pam-test"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PAM smoke-test binary for deckery-auth dev/CI — not installed in production"
+
+[[bin]]
+name = "deckery-pam-test"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
