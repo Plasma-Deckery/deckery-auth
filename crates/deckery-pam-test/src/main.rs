@@ -23,13 +23,12 @@ fn main() -> Result<()> {
     let user = CString::new(args[2].as_str())?;
     let pin = CString::new(args[3].as_str())?;
 
-    let result = run_pam_auth(&service, &user, &pin)?;
-    println!("{result}");
-    if result == "Authentication successful" {
-        Ok(())
-    } else {
-        std::process::exit(1);
-    }
+    let (code, msg) = run_pam_auth(&service, &user, &pin)?;
+    println!("{msg}");
+    // Exit based on the PAM return code, not the localised string —
+    // pam_strerror differs between implementations ("Success" on glibc/Fedora,
+    // "Authentication successful" on Arch, etc.).
+    std::process::exit(if code == PAM_SUCCESS { 0 } else { 1 });
 }
 
 // ── Raw PAM FFI ───────────────────────────────────────────────────────────────
@@ -110,7 +109,7 @@ unsafe extern "C" fn conv_fn(
     PAM_SUCCESS
 }
 
-fn run_pam_auth(service: &CStr, user: &CStr, pin: &CStr) -> Result<String> {
+fn run_pam_auth(service: &CStr, user: &CStr, pin: &CStr) -> Result<(libc::c_int, String)> {
     let conv = PamConv {
         conv: conv_fn,
         appdata_ptr: pin.as_ptr() as *mut libc::c_void,
@@ -129,6 +128,6 @@ fn run_pam_auth(service: &CStr, user: &CStr, pin: &CStr) -> Result<String> {
         let ret = pam_authenticate(pamh, 0);
         let msg = CStr::from_ptr(pam_strerror(pamh, ret)).to_string_lossy().into_owned();
         pam_end(pamh, ret);
-        Ok(msg)
+        Ok((ret, msg))
     }
 }
