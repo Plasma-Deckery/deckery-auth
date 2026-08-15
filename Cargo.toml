@@ -7,7 +7,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/Plasma-Deckery/deckery-auth"
 
 [workspace.dependencies]

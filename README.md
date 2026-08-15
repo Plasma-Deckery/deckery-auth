@@ -84,3 +84,7 @@ Since PIN verification happens rarely and locally (not a high-throughput API), p
 - The controller PIN is a separate secret from the user's login password. `pam_unix.so` remains fully functional as a fallback — nothing about the existing authentication path is removed or weakened.
 - `pam_deckery.so` is scoped to the `auth` PAM group only. It does not, and should not, appear in `account`, `session`, or `password` stacks — see the `acct_mgmt` note above for why that distinction matters.
 - `/etc/deckery/pin.hash` is written with `0600` permissions (root-only read/write).
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
