@@ -21,8 +21,9 @@ See [deckery#19](https://github.com/Plasma-Deckery/deckery/issues/19) and its co
 
 ## Crates
 
-- **`crates/deckery-pin-set`** — a standalone CLI tool, run once with `sudo`, that sets the controller PIN (argon2id hash written to `/etc/deckery/pin.hash`). This is **not** part of the PAM module itself — it only shares the hash file convention with it.
+- **`crates/deckery-pin-set`** — a standalone CLI tool, run once with `sudo`, that sets the controller PIN (argon2id hash written to `/etc/deckery/pin.hash`). This is **not** part of the PAM module itself — it only shares the hash file convention with it. Supports `--stdin` for non-interactive use in automated tests (reads the PIN from stdin instead of `/dev/tty`).
 - **`crates/deckery-pam`** — the PAM module. Builds to `pam_deckery.so` (PAM modules follow the `pam_*.so` naming convention — e.g. `pam_unix.so`, `pam_google_authenticator.so` — so the compiled artifact keeps that prefix even though the crate/directory is named `deckery-pam` per Deckery's own naming convention).
+- **`crates/deckery-pam-test`** — a dev/CI-only binary that calls `pam_authenticate` against a named PAM service via raw `libpam` FFI. Used by `deploy.sh` to smoke-test the full PAM chain without touching `/etc/pam.d/sudo`. Takes `<service> <user> <pin>` as arguments, exits 0 on `PAM_SUCCESS`. **Not installed in production** — the RPM spec excludes this binary.
 
 ## How the PAM module works
 
@@ -36,13 +37,45 @@ Three trait methods are implemented, each for a different reason:
 
 - **`acct_mgmt`** — belongs to PAM's "account" group, not "auth". Since `pam_deckery.so` is only registered under `auth` in `/etc/pam.d/`, this is never actually invoked by the intended stack config. It's implemented anyway, but deliberately returns `PamError::IGNORE`, not `SUCCESS`. Unlike `setcred`, account management *is* a real security decision (expired accounts, locked accounts, forced password changes) — returning unconditional `SUCCESS` here would silently wave through those checks if this module ever ended up in an `account` stack by mistake. `IGNORE` tells PAM to disregard this module's verdict entirely, regardless of whether it's `required`, `sufficient`, or `optional` — unlike `SUCCESS`, it cannot short-circuit a stack it has no business deciding.
 
-## Building
+## Building and deploying
+
+### Development (Bazzite / immutable Fedora)
+
+```bash
+./deploy.sh
+```
+
+Builds all crates inside the `deckery` Arch distrobox (for glibc compatibility — see [glibc note](#glibc-compatibility)), installs `pam_deckery.so` to `/usr/local/lib/security/` (writable on Bazzite's immutable filesystem), writes `/etc/pam.d/deckery-test`, and runs a two-step smoke test:
+
+1. Sets a temporary test PIN via `deckery-pin-set --stdin`
+2. Verifies correct PIN → `PAM_SUCCESS` and wrong PIN → auth failure via `deckery-pam-test`
+3. Restores the original `pin.hash` afterwards — the real PIN is never overwritten
+
+After a successful deploy, set your real PIN:
+
+```bash
+sudo ./target/release/deckery-pin-set
+```
+
+### RPM (production)
+
+```bash
+./deploy.sh --mode=rpm
+```
+
+Build only — leaves artifacts in `target/release/` for the RPM build process. No files are copied, no system state is changed.
+
+### Manual build
 
 ```bash
 cargo build --release
 ```
 
-`deckery-pam` requires the `libpam` headers to be available at build time (via the `pamsm` crate's `libpam` feature).
+`deckery-pam` requires the `libpam` headers to be available at build time (via the `pamsm` crate's `libpam` feature). `deckery-pam-test` links `libpam` directly via `build.rs`.
+
+### glibc compatibility
+
+Built in the Arch distrobox (glibc 2.43); host Bazzite has glibc 2.42. Verified via `objdump -T`: both `libpam_deckery.so` and `deckery-pin-set` require only symbols up to `GLIBC_2.34`, well below the host's version — no compatibility issue. `cargo zigbuild` is available as a future safeguard if a new dependency ever pulls in a newer symbol.
 
 ## PAM stack
 
