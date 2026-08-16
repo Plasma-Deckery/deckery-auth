@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/deckery-pin-set",
-    "crates/deckery-pam",
-    "crates/deckery-pam-test",
+    "deckery-pin-set",
+    "deckery-pam",
+    "deckery-pam-test",
+    "deckery-polkit-agent",
 ]
 
 [workspace.package]
