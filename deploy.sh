@@ -92,6 +92,20 @@ auth  sufficient  pam_unix.so
 auth  required    pam_deny.so
 EOF
 
+# ── Dev mode: activate for sudo ───────────────────────────────────────────────
+# authselect does not manage service-specific files like /etc/pam.d/sudo —
+# only the common stacks (system-auth, password-auth, etc.). Direct editing
+# is therefore safe and the established approach (same as howdy, google-
+# authenticator-libpam). Idempotent: skipped if already present.
+
+echo "    activating pam_deckery.so in /etc/pam.d/sudo"
+if ! sudo grep -q "pam_deckery.so" /etc/pam.d/sudo; then
+    sudo sed -i "/auth.*include.*system-auth/i auth  sufficient  $DEV_PAM_SO" /etc/pam.d/sudo
+    echo "    ✓ added"
+else
+    echo "    (already present — skipped)"
+fi
+
 # ── Dev mode: smoke test ──────────────────────────────────────────────────────
 
 echo ""
@@ -148,9 +162,10 @@ if [[ $FAIL -eq 0 ]]; then
     echo "==> Smoke test passed ($PASS/2) ✓"
     echo ""
     echo "    pam_deckery.so is installed and verified at $DEV_PAM_SO"
+    echo "    Active for sudo:   /etc/pam.d/sudo"
     echo "    Test PAM service:  $PAM_TEST_SERVICE"
     echo ""
-    echo "    To set your real PIN:"
+    echo "    Set your real PIN:"
     echo "    sudo $PIN_SET_BIN"
 else
     echo "==> Smoke test FAILED ($FAIL/2 failures)" >&2
