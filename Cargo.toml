@@ -5,6 +5,7 @@ members = [
     "deckery-pam",
     "deckery-pam-test",
     "deckery-polkit-agent",
+    "deckery-input",
 ]
 
 [workspace.package]
