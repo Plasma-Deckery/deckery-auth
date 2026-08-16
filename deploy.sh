@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# deploy.sh — build and install deckery-auth
+# deploy.sh — build, install, or uninstall deckery-auth (dev)
 #
 # Usage:
-#   ./deploy.sh [--mode=dev|rpm]
+#   ./deploy.sh [--mode=dev|rpm] [--uninstall]
 #
 # Modes:
 #   dev (default)  Build inside the deckery distrobox, install pam_deckery.so
-#                  to /usr/local/lib/security/ (writable on Bazzite), create
-#                  /etc/deckery/, write /etc/pam.d/deckery-test, and run an
-#                  isolated PAM smoke test:
-#                    1. Set a test PIN via deckery-pin-set --stdin (tests hash
-#                       generation through our real code, no hardcoded hash)
-#                    2. Verify correct PIN → PAM_SUCCESS
-#                    3. Verify wrong PIN  → PAM auth failure
-#                    4. Restore original pin.hash (real PIN untouched)
+#                  to /usr/local/lib/security/ (writable on Bazzite), run an
+#                  isolated PAM smoke test, then activate via install-pammodule.sh.
 #
 #   rpm            Build only. Leaves artifacts in target/release/ for the
-#                  RPM build process to pick up — no copying, no system changes.
+#                  RPM build process — no system changes.
+#
+# Flags:
+#   --uninstall    Reverse the install: remove pam_deckery.so from
+#                  /etc/pam.d/sudo and clean up installed files.
+#                  Does NOT remove /etc/deckery/pin.hash.
 
 set -euo pipefail
 
@@ -25,16 +24,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 MODE="dev"
+UNINSTALL=false
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 for arg in "$@"; do
     case "$arg" in
-        --mode=dev) MODE="dev" ;;
-        --mode=rpm) MODE="rpm" ;;
+        --mode=dev)  MODE="dev" ;;
+        --mode=rpm)  MODE="rpm" ;;
+        --uninstall) UNINSTALL=true ;;
         *)
             echo "Unknown argument: $arg" >&2
-            echo "Usage: $0 [--mode=dev|rpm]" >&2
+            echo "Usage: $0 [--mode=dev|rpm] [--uninstall]" >&2
             exit 1
             ;;
     esac
@@ -46,8 +47,8 @@ DISTROBOX="deckery"
 SO_SRC="$SCRIPT_DIR/target/release/libpam_deckery.so"
 PIN_SET_BIN="$SCRIPT_DIR/target/release/deckery-pin-set"
 PAM_TEST_BIN="$SCRIPT_DIR/target/release/deckery-pam-test"
+INSTALL_SCRIPT="$SCRIPT_DIR/configure-pam.sh"
 
-# dev-mode install targets
 DEV_PAM_DIR="/usr/local/lib/security"
 DEV_PAM_SO="$DEV_PAM_DIR/pam_deckery.so"
 DECKERY_CONF_DIR="/etc/deckery"
@@ -56,6 +57,30 @@ HASH_BACKUP="$DECKERY_CONF_DIR/pin.hash.deploy-bak"
 PAM_TEST_SERVICE="/etc/pam.d/deckery-test"
 
 TEST_PIN="1234"
+
+# ── Uninstall ─────────────────────────────────────────────────────────────────
+
+if [[ "$UNINSTALL" == true ]]; then
+    echo "==> Uninstalling deckery-auth (dev)"
+    echo ""
+
+    sudo bash "$INSTALL_SCRIPT" --uninstall
+
+    echo "    removing $DEV_PAM_SO"
+    if [[ -f "$DEV_PAM_SO" ]]; then
+        sudo rm "$DEV_PAM_SO"
+        echo "    ✓ removed"
+    else
+        echo "    (not present — skipped)"
+    fi
+
+    echo ""
+    echo "    NOTE: /etc/deckery/pin.hash was NOT removed."
+    echo "    Remove manually if needed: sudo rm $HASH_FILE"
+    echo ""
+    echo "==> Uninstall complete."
+    exit 0
+fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
@@ -71,10 +96,10 @@ if [[ "$MODE" == "rpm" ]]; then
     exit 0
 fi
 
-# ── Dev mode: install ─────────────────────────────────────────────────────────
+# ── Install ───────────────────────────────────────────────────────────────────
 
 echo ""
-echo "==> Installing (dev mode)"
+echo "==> Installing"
 
 echo "    mkdir -p $DEV_PAM_DIR"
 sudo mkdir -p "$DEV_PAM_DIR"
@@ -85,31 +110,19 @@ sudo cp "$SO_SRC" "$DEV_PAM_SO"
 echo "    mkdir -p $DECKERY_CONF_DIR"
 sudo mkdir -p "$DECKERY_CONF_DIR"
 
+# ── Smoke test ────────────────────────────────────────────────────────────────
+# Uses an isolated /etc/pam.d/deckery-test service — /etc/pam.d/sudo is not
+# touched until the test passes. The test service is removed afterwards.
+
+echo ""
+echo "==> Smoke test"
+
 echo "    writing $PAM_TEST_SERVICE"
 sudo tee "$PAM_TEST_SERVICE" > /dev/null <<EOF
 auth  sufficient  $DEV_PAM_SO
 auth  sufficient  pam_unix.so
 auth  required    pam_deny.so
 EOF
-
-# ── Dev mode: activate for sudo ───────────────────────────────────────────────
-# authselect does not manage service-specific files like /etc/pam.d/sudo —
-# only the common stacks (system-auth, password-auth, etc.). Direct editing
-# is therefore safe and the established approach (same as howdy, google-
-# authenticator-libpam). Idempotent: skipped if already present.
-
-echo "    activating pam_deckery.so in /etc/pam.d/sudo"
-if ! sudo grep -q "pam_deckery.so" /etc/pam.d/sudo; then
-    sudo sed -i "/auth.*include.*system-auth/i auth  sufficient  $DEV_PAM_SO" /etc/pam.d/sudo
-    echo "    ✓ added"
-else
-    echo "    (already present — skipped)"
-fi
-
-# ── Dev mode: smoke test ──────────────────────────────────────────────────────
-
-echo ""
-echo "==> Smoke test"
 
 # Backup existing hash if present
 HASH_EXISTED=false
@@ -119,7 +132,7 @@ if [[ -f "$HASH_FILE" ]]; then
     sudo cp "$HASH_FILE" "$HASH_BACKUP"
 fi
 
-# Set test PIN via our real deckery-pin-set binary (tests hash generation too)
+# Set test PIN via deckery-pin-set --stdin (tests hash generation too)
 echo "    setting test PIN via deckery-pin-set --stdin"
 printf '%s\n' "$TEST_PIN" | sudo "$PIN_SET_BIN" --stdin
 
@@ -156,18 +169,32 @@ else
     sudo rm -f "$HASH_FILE"
 fi
 
-# Report
-echo ""
-if [[ $FAIL -eq 0 ]]; then
-    echo "==> Smoke test passed ($PASS/2) ✓"
+# Always remove the test service — it has no purpose after the smoke test
+echo "    removing $PAM_TEST_SERVICE"
+sudo rm -f "$PAM_TEST_SERVICE"
+
+if [[ $FAIL -gt 0 ]]; then
     echo ""
-    echo "    pam_deckery.so is installed and verified at $DEV_PAM_SO"
-    echo "    Active for sudo:   /etc/pam.d/sudo"
-    echo "    Test PAM service:  $PAM_TEST_SERVICE"
-    echo ""
-    echo "    Set your real PIN:"
-    echo "    sudo $PIN_SET_BIN"
-else
-    echo "==> Smoke test FAILED ($FAIL/2 failures)" >&2
+    echo "==> Smoke test FAILED ($FAIL/2 failures) — aborting install" >&2
     exit 1
 fi
+
+echo ""
+echo "==> Smoke test passed ($PASS/2) ✓"
+
+# ── Activate ──────────────────────────────────────────────────────────────────
+
+echo ""
+echo "==> Activating"
+sudo bash "$INSTALL_SCRIPT" --so-path="$DEV_PAM_SO"
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "==> Done."
+echo ""
+echo "    pam_deckery.so: $DEV_PAM_SO"
+echo "    Active for:     /etc/pam.d/sudo"
+echo ""
+echo "    Set your real PIN:"
+echo "    sudo $PIN_SET_BIN"
