@@ -1,32 +1,53 @@
-//! [`TokenReader`] — translates raw evdev events into [`Token`]s.
+//! [`TokenReader`] — async translation of controller events into [`Token`]s.
+//!
+//! # Token rules
+//!
+//! - Every button press emits [`Token::Chord`] containing all currently held
+//!   buttons (including the one just pressed), in press order.
+//! - Every button release emits [`Token::Release`] immediately.
+//! - Control buttons (Confirm / Backspace / Cancel) emit [`Token::Control`]
+//!   on press only; their release is silently ignored.
+//! - Key auto-repeat events (value = 2) are ignored throughout.
+//!
+//! [`Token::Release`] encodes to an empty string and is therefore excluded
+//! from the PAM credential. It exists solely for the visualization layer.
 
-use evdev::{Device, EventType, Key};
-use std::collections::HashSet;
+use evdev::{EventType, InputEvent, Key};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify};
 
-use crate::{Button, ControlAction, Modifier, Token};
+use deckery_controller::{
+    ControllerEvent, HapticRequest, LizardModeHandle, LizardModeSuppression,
+    SteamDeckController,
+};
 
-/// Maps evdev [`Key`] codes to our [`Button`] type.
+use crate::{Button, ControlAction, Token};
+
+// ── Key → token mapping ───────────────────────────────────────────────────────
+
 fn key_to_button(key: Key) -> Option<Button> {
     match key {
-        Key::BTN_SOUTH => Some(Button::A),
-        Key::BTN_EAST  => Some(Button::B),
-        Key::BTN_NORTH => Some(Button::Y),
-        Key::BTN_WEST  => Some(Button::X),
-        Key::BTN_TL2   => Some(Button::L2),
-        Key::BTN_TR2   => Some(Button::R2),
-        // Back paddles — Steam Deck uses BTN_TRIGGER_HAPPY* for paddles
-        Key::BTN_TRIGGER_HAPPY1 => Some(Button::L4),
-        Key::BTN_TRIGGER_HAPPY2 => Some(Button::R4),
-        Key::BTN_TRIGGER_HAPPY3 => Some(Button::L5),
-        Key::BTN_TRIGGER_HAPPY4 => Some(Button::R5),
-        _ => None,
-    }
-}
-
-fn key_to_modifier(key: Key) -> Option<Modifier> {
-    match key {
-        Key::BTN_TL => Some(Modifier::L1),
-        Key::BTN_TR => Some(Modifier::R1),
+        Key::BTN_SOUTH  => Some(Button::A),
+        Key::BTN_EAST   => Some(Button::B),
+        Key::BTN_NORTH  => Some(Button::Y),
+        Key::BTN_WEST   => Some(Button::X),
+        // Shoulder buttons — regular buttons, not special modifiers.
+        Key::BTN_TL     => Some(Button::L1),
+        Key::BTN_TR     => Some(Button::R1),
+        // Triggers (digital)
+        Key::BTN_TL2    => Some(Button::L2),
+        Key::BTN_TR2    => Some(Button::R2),
+        // Back paddles — requires the Plasma-Deckery evdev fork.
+        Key::BTN_GRIPL  => Some(Button::L4),
+        Key::BTN_GRIPR  => Some(Button::R4),
+        Key::BTN_GRIPL2 => Some(Button::L5),
+        Key::BTN_GRIPR2 => Some(Button::R5),
+        // D-pad as discrete key events (BTN_DPAD_*).
+        Key::BTN_DPAD_UP    => Some(Button::Up),
+        Key::BTN_DPAD_DOWN  => Some(Button::Down),
+        Key::BTN_DPAD_LEFT  => Some(Button::Left),
+        Key::BTN_DPAD_RIGHT => Some(Button::Right),
         _ => None,
     }
 }
@@ -35,158 +56,350 @@ fn key_to_control(key: Key) -> Option<ControlAction> {
     match key {
         Key::BTN_START  => Some(ControlAction::Confirm),
         Key::BTN_SELECT => Some(ControlAction::Backspace),
-        Key::BTN_MODE   => Some(ControlAction::Cancel), // Home / Steam button
+        Key::BTN_BASE   => Some(ControlAction::Cancel),
         _ => None,
     }
 }
 
-/// State of one modifier (L1 or R1).
-#[derive(Debug, Default)]
-struct ModifierState {
-    held: bool,
-    taps: Vec<Button>,
-}
+// ── TokenReader ───────────────────────────────────────────────────────────────
 
-/// Reads raw evdev events from a controller device and produces [`Token`]s.
+/// Translates a stream of [`ControllerEvent`]s into auth [`Token`]s.
 ///
-/// Call [`TokenReader::next_token`] in a loop to receive tokens one at a time.
-/// Blocks until the next relevant event arrives.
+/// Construct via [`TokenReader::open`] for production use, or
+/// [`TokenReader::from_channel`] for testing.
 pub struct TokenReader {
-    device: Device,
-    l1: ModifierState,
-    r1: ModifierState,
-    /// D-Pad axis state: tracks which direction is currently active.
-    dpad_x: i32,
-    dpad_y: i32,
-    /// Keys currently held (for detecting simultaneous presses in future).
-    _held_keys: HashSet<Key>,
+    rx:           mpsc::Receiver<ControllerEvent>,
+    path:         PathBuf,
+    /// Keeps Lizard Mode suppression alive. `None` in tests (no hardware).
+    _lizard_mode: Option<LizardModeHandle>,
+    /// Haptic feedback channel. `None` if no hidraw sibling was found.
+    haptic_tx:    Option<mpsc::Sender<HapticRequest>>,
+    /// Buttons currently held down, in press order (oldest first).
+    held:         Vec<Button>,
 }
 
 impl TokenReader {
-    pub fn new(device: Device) -> Self {
-        Self {
-            device,
-            l1: ModifierState::default(),
-            r1: ModifierState::default(),
-            dpad_x: 0,
-            dpad_y: 0,
-            _held_keys: HashSet::new(),
-        }
+    // ── Constructors ──────────────────────────────────────────────────────────
+
+    /// Create a `TokenReader` from an existing event channel.
+    ///
+    /// Used in tests and by higher-level code that manages the hardware task
+    /// separately. Lizard Mode suppression and haptics are not active.
+    pub fn from_channel(rx: mpsc::Receiver<ControllerEvent>, path: PathBuf) -> Self {
+        Self { rx, path, _lizard_mode: None, haptic_tx: None, held: Vec::new() }
     }
 
-    /// Block until the next [`Token`] is produced.
-    pub fn next_token(&mut self) -> Result<Token, std::io::Error> {
+    /// Find the Steam Deck controller, grab it exclusively, start Lizard Mode
+    /// suppression and hidraw tasks, and return a ready `TokenReader`.
+    pub async fn open() -> Result<Self, std::io::Error> {
+        let controller = SteamDeckController::find()
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no Steam Deck controller found — is the controller connected?",
+            ))?;
+
+        let path = controller.evdev_path.clone();
+        let lizard_cfg = LizardModeSuppression {
+            suppress_buttons: true,
+            suppress_mouse:   true,
+        };
+
+        // Give other consumers (e.g. makima) time to receive pending release
+        // events before the grab takes exclusive ownership of the device.
+        // TODO: replace with a cooperative notification mechanism between
+        // deckery-controller sessions so they can send synthetic releases.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let session = controller
+            .start(/*grab=*/ true, Arc::new(Notify::new()), Some(lizard_cfg))
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "failed to open controller device — check permissions",
+            ))?;
+
+        Ok(Self {
+            rx:           session.event_rx,
+            path,
+            _lizard_mode: Some(session.lizard_mode),
+            haptic_tx:    session.haptic_tx,
+            held:         Vec::new(),
+        })
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /// The `/dev/input/eventN` path of the grabbed device.
+    pub fn path(&self) -> &std::path::Path { &self.path }
+
+    /// Haptic feedback sender, if available.
+    pub fn haptic_tx(&self) -> Option<&mpsc::Sender<HapticRequest>> {
+        self.haptic_tx.as_ref()
+    }
+
+    /// Wait for the next [`Token`].
+    ///
+    /// Returns `Err` when the channel is closed (device gone or hardware task
+    /// exited).
+    pub async fn next_token(&mut self) -> Result<Token, std::io::Error> {
         loop {
-            // Collect into Vec first to end the borrow on self.device before
-            // calling self.process_event(), which also needs &mut self.
-            let events: Vec<_> = self.device.fetch_events()?.collect();
-            for event in events {
-                if let Some(token) = self.process_event(event) {
-                    return Ok(token);
+            match self.rx.recv().await {
+                Some(ControllerEvent::Input(event)) => {
+                    if let Some(token) = self.process(event) {
+                        return Ok(token);
+                    }
                 }
+                Some(ControllerEvent::Reconnected) => self.reset(),
+                None => return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "controller event channel closed",
+                )),
             }
         }
     }
 
-    fn process_event(&mut self, event: evdev::InputEvent) -> Option<Token> {
-        match event.event_type() {
-            EventType::KEY => self.handle_key(Key::new(event.code()), event.value()),
-            EventType::ABSOLUTE => self.handle_absolute(event.code(), event.value()),
-            _ => None,
-        }
+    /// Reset held-button state (called on reconnect).
+    pub fn reset(&mut self) {
+        self.held.clear();
     }
 
-    /// Handle a key press (value=1), release (value=0), or repeat (value=2).
-    fn handle_key(&mut self, key: Key, value: i32) -> Option<Token> {
+    // ── Event processing ──────────────────────────────────────────────────────
+
+    fn process(&mut self, event: InputEvent) -> Option<Token> {
+        if event.event_type() != EventType::KEY { return None; }
+        let key      = Key::new(event.code());
+        let value    = event.value();
         let pressed  = value == 1;
         let released = value == 0;
+        // value == 2 is auto-repeat — ignored
 
-        // Control actions fire on press.
         if pressed {
             if let Some(action) = key_to_control(key) {
                 return Some(Token::Control(action));
             }
         }
 
-        // Modifier press/release.
-        if let Some(modifier) = key_to_modifier(key) {
-            return self.handle_modifier(modifier, pressed, released);
-        }
-
-        // Regular button press (only on press, not repeat or release).
-        if pressed {
-            if let Some(button) = key_to_button(key) {
-                return self.handle_button(button);
-            }
+        if let Some(button) = key_to_button(key) {
+            if pressed  { return Some(self.handle_press(button)); }
+            if released { return Some(self.handle_release(button)); }
         }
 
         None
     }
 
-    fn handle_modifier(&mut self, modifier: Modifier, pressed: bool, released: bool) -> Option<Token> {
-        let state = match modifier {
-            Modifier::L1 => &mut self.l1,
-            Modifier::R1 => &mut self.r1,
-        };
-
-        if pressed {
-            state.held = true;
-            state.taps.clear();
-            return None;
-        }
-
-        if released && state.held {
-            state.held = false;
-            let taps = std::mem::take(&mut state.taps);
-            return Some(if taps.is_empty() {
-                Token::PhraseEmpty
-            } else {
-                Token::PhraseEnd(modifier, taps)
-            });
-        }
-
-        None
+    fn handle_press(&mut self, button: Button) -> Token {
+        self.held.push(button);
+        Token::Chord(self.held.clone())
     }
 
-    fn handle_button(&mut self, button: Button) -> Option<Token> {
-        // If either modifier is held, this tap goes into that phrase.
-        if self.l1.held {
-            self.l1.taps.push(button);
-            return None;
-        }
-        if self.r1.held {
-            self.r1.taps.push(button);
-            return None;
-        }
-        // No modifier held — simple press.
-        Some(Token::SimplePress(button))
+    fn handle_release(&mut self, button: Button) -> Token {
+        self.held.retain(|&b| b != button);
+        Token::Release(button)
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evdev::EventType;
+
+    fn press(key: Key) -> ControllerEvent {
+        ControllerEvent::Input(InputEvent::new(EventType::KEY, key.code(), 1))
     }
 
-    /// Handle D-Pad absolute axis events (ABS_HAT0X / ABS_HAT0Y).
-    fn handle_absolute(&mut self, code: u16, value: i32) -> Option<Token> {
-        const ABS_HAT0X: u16 = 16;
-        const ABS_HAT0Y: u16 = 17;
+    fn release(key: Key) -> ControllerEvent {
+        ControllerEvent::Input(InputEvent::new(EventType::KEY, key.code(), 0))
+    }
 
-        match code {
-            ABS_HAT0X => {
-                let prev = self.dpad_x;
-                self.dpad_x = value;
-                // Only produce a token on the transition from 0 → direction.
-                if prev == 0 && value != 0 {
-                    let button = if value > 0 { Button::Right } else { Button::Left };
-                    return self.handle_button(button);
-                }
-            }
-            ABS_HAT0Y => {
-                let prev = self.dpad_y;
-                self.dpad_y = value;
-                if prev == 0 && value != 0 {
-                    let button = if value > 0 { Button::Down } else { Button::Up };
-                    return self.handle_button(button);
-                }
-            }
-            _ => {}
+    fn make_reader() -> (mpsc::Sender<ControllerEvent>, TokenReader) {
+        let (tx, rx) = mpsc::channel(64);
+        let reader = TokenReader::from_channel(rx, PathBuf::from("/dev/input/test"));
+        (tx, reader)
+    }
+
+    fn chord(buttons: &[Button]) -> Token {
+        Token::Chord(buttons.to_vec())
+    }
+
+    // ── Single-button presses ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn simple_press_face_buttons() {
+        let (tx, mut reader) = make_reader();
+        for (key, btn) in [
+            (Key::BTN_SOUTH, Button::A),
+            (Key::BTN_EAST,  Button::B),
+            (Key::BTN_NORTH, Button::Y),
+            (Key::BTN_WEST,  Button::X),
+        ] {
+            tx.send(press(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), chord(&[btn]));
+            tx.send(release(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), Token::Release(btn));
         }
-        None
+    }
+
+    #[tokio::test]
+    async fn shoulder_buttons_are_regular() {
+        let (tx, mut reader) = make_reader();
+        tx.send(press(Key::BTN_TL)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::L1]));
+        tx.send(release(Key::BTN_TL)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::L1));
+
+        tx.send(press(Key::BTN_TR)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::R1]));
+        tx.send(release(Key::BTN_TR)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::R1));
+    }
+
+    #[tokio::test]
+    async fn triggers_and_paddles() {
+        let (tx, mut reader) = make_reader();
+        for (key, btn) in [
+            (Key::BTN_TL2,    Button::L2),
+            (Key::BTN_TR2,    Button::R2),
+            (Key::BTN_GRIPL,  Button::L4),
+            (Key::BTN_GRIPR,  Button::R4),
+            (Key::BTN_GRIPL2, Button::L5),
+            (Key::BTN_GRIPR2, Button::R5),
+        ] {
+            tx.send(press(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), chord(&[btn]));
+            tx.send(release(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), Token::Release(btn));
+        }
+    }
+
+    #[tokio::test]
+    async fn dpad_directions() {
+        let (tx, mut reader) = make_reader();
+        for (key, btn) in [
+            (Key::BTN_DPAD_UP,    Button::Up),
+            (Key::BTN_DPAD_DOWN,  Button::Down),
+            (Key::BTN_DPAD_LEFT,  Button::Left),
+            (Key::BTN_DPAD_RIGHT, Button::Right),
+        ] {
+            tx.send(press(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), chord(&[btn]));
+            tx.send(release(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), Token::Release(btn));
+        }
+    }
+
+    // ── Control actions ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn control_actions() {
+        let (tx, mut reader) = make_reader();
+        for (key, expected) in [
+            (Key::BTN_START,  ControlAction::Confirm),
+            (Key::BTN_SELECT, ControlAction::Backspace),
+            (Key::BTN_BASE,   ControlAction::Cancel),
+        ] {
+            tx.send(press(key)).await.unwrap();
+            assert_eq!(reader.next_token().await.unwrap(), Token::Control(expected));
+            tx.send(release(key)).await.unwrap(); // silently ignored
+        }
+        tx.send(press(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::A]));
+    }
+
+    // ── Chords (multi-button) ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chord_down_a() {
+        // Hold ↓, press A → held grows: [↓] then [↓, A].
+        let (tx, mut reader) = make_reader();
+        tx.send(press(Key::BTN_DPAD_DOWN)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down]));
+
+        tx.send(press(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down, Button::A]));
+
+        tx.send(release(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::A));
+        tx.send(release(Key::BTN_DPAD_DOWN)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::Down));
+    }
+
+    #[tokio::test]
+    async fn chord_three_buttons() {
+        // Hold ↓, press A, press B → [↓], [↓,A], [↓,A,B].
+        let (tx, mut reader) = make_reader();
+        tx.send(press(Key::BTN_DPAD_DOWN)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down]));
+
+        tx.send(press(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down, Button::A]));
+
+        tx.send(press(Key::BTN_EAST)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down, Button::A, Button::B]));
+    }
+
+    #[tokio::test]
+    async fn chord_l1_a() {
+        let (tx, mut reader) = make_reader();
+        tx.send(press(Key::BTN_TL)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::L1]));
+
+        tx.send(press(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::L1, Button::A]));
+
+        tx.send(release(Key::BTN_TL)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::L1));
+        tx.send(release(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::A));
+    }
+
+    #[tokio::test]
+    async fn sequential_presses_no_chord() {
+        // Release ↓ before pressing A → separate single-button chords.
+        let (tx, mut reader) = make_reader();
+        tx.send(press(Key::BTN_DPAD_DOWN)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down]));
+        tx.send(release(Key::BTN_DPAD_DOWN)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::Down));
+        tx.send(press(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::A]));
+        tx.send(release(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), Token::Release(Button::A));
+    }
+
+    // ── Key repeat ignored ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn key_repeat_ignored() {
+        let (tx, mut reader) = make_reader();
+        tx.send(ControllerEvent::Input(
+            InputEvent::new(EventType::KEY, Key::BTN_SOUTH.code(), 2)
+        )).await.unwrap();
+        tx.send(press(Key::BTN_EAST)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::B]));
+    }
+
+    // ── Reconnect ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reconnect_clears_held() {
+        let (tx, mut reader) = make_reader();
+        tx.send(press(Key::BTN_DPAD_DOWN)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::Down]));
+
+        tx.send(ControllerEvent::Reconnected).await.unwrap();
+
+        // held cleared — next press is a fresh single-button chord.
+        tx.send(press(Key::BTN_SOUTH)).await.unwrap();
+        assert_eq!(reader.next_token().await.unwrap(), chord(&[Button::A]));
+    }
+
+    // ── Channel closed ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn channel_closed_returns_error() {
+        let (tx, mut reader) = make_reader();
+        drop(tx);
+        assert!(reader.next_token().await.is_err());
     }
 }

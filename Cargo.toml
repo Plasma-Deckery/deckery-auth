@@ -6,6 +6,7 @@ members = [
     "deckery-pam-test",
     "deckery-polkit-agent",
     "deckery-input",
+    "deckery-auth-daemon",
 ]
 
 [workspace.package]
@@ -18,3 +19,10 @@ argon2 = "0.5"
 rand = "0.8"
 anyhow = "1"
 libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+
+[patch.crates-io]
+# evdev 0.12.x upstream is missing BTN_GRIPL/GRIPR/GRIPL2/GRIPR2 (Steam Deck
+# back paddles, 0x224–0x227). Using the Plasma-Deckery fork until these codes
+# are merged upstream. Track: https://github.com/emberian/evdev/pull/178
+evdev = { git = "https://github.com/Plasma-Deckery/evdev", rev = "e428a6fe10c0f577ef05c38e85eaefd6eed8be1b" }
