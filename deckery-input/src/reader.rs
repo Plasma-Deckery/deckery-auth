@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 
 use deckery_controller::{
-    ControllerEvent, HapticRequest, LizardModeHandle, LizardModeSuppression,
+    ControllerEvent, GrabbedHandle, HapticRequest, LizardModeHandle, LizardModeSuppression,
     SteamDeckController,
 };
 
@@ -70,6 +70,10 @@ fn key_to_control(key: Key) -> Option<ControlAction> {
 pub struct TokenReader {
     rx:           mpsc::Receiver<ControllerEvent>,
     path:         PathBuf,
+    /// RAII guard for the exclusive evdev grab acquired via the yield protocol.
+    /// Dropping it emits `GrabReleased` on the pre-established D-Bus connection
+    /// so yieldable sessions know they can re-grab. `None` when not grabbed.
+    _grab_handle: Option<GrabbedHandle>,
     /// Keeps Lizard Mode suppression alive. `None` in tests (no hardware).
     _lizard_mode: Option<LizardModeHandle>,
     /// Haptic feedback channel. `None` if no hidraw sibling was found.
@@ -86,13 +90,13 @@ impl TokenReader {
     /// Used in tests and by higher-level code that manages the hardware task
     /// separately. Lizard Mode suppression and haptics are not active.
     pub fn from_channel(rx: mpsc::Receiver<ControllerEvent>, path: PathBuf) -> Self {
-        Self { rx, path, _lizard_mode: None, haptic_tx: None, held: Vec::new() }
+        Self { rx, path, _grab_handle: None, _lizard_mode: None, haptic_tx: None, held: Vec::new() }
     }
 
     /// Find the Steam Deck controller, grab it exclusively, start Lizard Mode
     /// suppression and hidraw tasks, and return a ready `TokenReader`.
     pub async fn open() -> Result<Self, std::io::Error> {
-        let controller = SteamDeckController::find()
+        let controller = SteamDeckController::find(/*yieldable=*/ false)
             .ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "no Steam Deck controller found — is the controller connected?",
@@ -104,22 +108,16 @@ impl TokenReader {
             suppress_mouse:   true,
         };
 
-        // Give other consumers (e.g. makima) time to receive pending release
-        // events before the grab takes exclusive ownership of the device.
-        // TODO: replace with a cooperative notification mechanism between
-        // deckery-controller sessions so they can send synthetic releases.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let session = controller
-            .start(/*grab=*/ true, Arc::new(Notify::new()), Some(lizard_cfg))
-            .ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "failed to open controller device — check permissions",
-            ))?;
+        let session = controller.start(
+            /*grab=*/ true,
+            Arc::new(Notify::new()),
+            Some(lizard_cfg),
+        ).await?;
 
         Ok(Self {
             rx:           session.event_rx,
             path,
+            _grab_handle: session.grab_handle,
             _lizard_mode: Some(session.lizard_mode),
             haptic_tx:    session.haptic_tx,
             held:         Vec::new(),
@@ -149,6 +147,7 @@ impl TokenReader {
                     }
                 }
                 Some(ControllerEvent::Reconnected) => self.reset(),
+                Some(ControllerEvent::ReleaseAll)  => self.reset(),
                 None => return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "controller event channel closed",
