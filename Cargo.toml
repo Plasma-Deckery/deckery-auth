@@ -7,6 +7,7 @@ members = [
     "deckery-polkit-agent",
     "deckery-input",
     "deckery-auth-daemon",
+    "deckery-auth-ui",
 ]
 
 [workspace.package]

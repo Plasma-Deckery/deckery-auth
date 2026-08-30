@@ -1,0 +1,5 @@
+# cxx-qt 0.10.0 was tested against Rust 1.85.0 in CI.
+# Rust 1.96 introduced stricter macro-in-foreign-position checks that break
+# cxx's include!(<QtCore/QObject>) syntax inside #[cxx::bridge].
+[toolchain]
+channel = "1.85"
