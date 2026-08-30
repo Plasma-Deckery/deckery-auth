@@ -21,7 +21,7 @@ ApplicationWindow {
     // Anchor all edges → full-screen canvas; the visible content is a small
     // centred card. This lets us dim the whole screen behind the card later.
     LayerShell.Window.layer:                 LayerShell.Window.LayerOverlay
-    LayerShell.Window.anchors:               LayerShell.Window.AnchorAll
+    LayerShell.Window.anchors:               LayerShell.Window.AnchorTop | LayerShell.Window.AnchorBottom | LayerShell.Window.AnchorLeft | LayerShell.Window.AnchorRight
     LayerShell.Window.keyboardInteractivity: LayerShell.Window.KeyboardInteractivityNone
     // We do not need keyboard input — controller only.  If the password
     // fallback mode is added later, switch to KeyboardInteractivityOnDemand.
@@ -37,20 +37,20 @@ ApplicationWindow {
     property bool   finishing:   false       // brief visual hold before hiding
 
     // ── DisplayClient connection ──────────────────────────────────────────────
+    // Poll the Rust event queue every 50 ms on the Qt main thread.
+    Timer {
+        interval: 50
+        repeat:   true
+        running:  true
+        onTriggered: client.poll()
+    }
+
     DisplayClient {
         id: client
 
-        Component.onCompleted: client.startListening()
+        Component.onCompleted: client.start_listening()
 
-        // Poll the Rust event queue every 50 ms on the Qt main thread.
-        Timer {
-            interval: 50
-            repeat:   true
-            running:  true
-            onTriggered: client.poll()
-        }
-
-        onSessionStarted: (source) => {
+        onSession_started: (source) => {
             root.authSource = source
             root.tokens     = []
             root.statusText = ""
@@ -58,11 +58,11 @@ ApplicationWindow {
             root.visible    = true
         }
 
-        onTokenAdded: (token) => {
+        onToken_added: (token) => {
             root.tokens = root.tokens.concat([token])
         }
 
-        onBackspacePressed: {
+        onBackspace_pressed: {
             if (root.tokens.length > 0)
                 root.tokens = root.tokens.slice(0, root.tokens.length - 1)
         }
@@ -77,7 +77,7 @@ ApplicationWindow {
             root.finishing  = true
         }
 
-        onSessionEnded: {
+        onSession_ended: {
             // Small delay so the user sees the ✓/✗ before the overlay hides.
             hideTimer.restart()
         }

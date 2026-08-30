@@ -9,7 +9,7 @@ fn main() {
     let mut engine = QQmlApplicationEngine::new();
 
     if let Some(engine) = engine.as_mut() {
-        engine.load(&QUrl::from("qrc:/qt/qml/org/deckery/authui/PinDisplay.qml"));
+        engine.load(&QUrl::from("qrc:/qt/qml/org/deckery/authui/qml/PinDisplay.qml"));
     }
 
     if let Some(app) = app.as_mut() {
