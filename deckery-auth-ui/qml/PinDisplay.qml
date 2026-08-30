@@ -180,6 +180,35 @@ ApplicationWindow {
                     horizontalAlignment: Text.AlignHCenter
                     visible:          !root.finishing
                 }
+
+                // ── Cancel button (touch / mouse fallback) ─────────────────────
+                // The primary cancel path is the controller (Menu / ☰ button).
+                // This button provides a pointer-device fallback — useful during
+                // development and on non-Steam-Deck targets.
+                Rectangle {
+                    Layout.alignment:  Qt.AlignHCenter
+                    width:             120
+                    height:            36
+                    radius:            8
+                    color:             cancelArea.containsMouse ? "#3d2020" : "#2a1a1a"
+                    border.color:      "#f38ba8"
+                    border.width:      1
+                    visible:           !root.finishing
+
+                    Text {
+                        anchors.centerIn: parent
+                        text:             "Cancel"
+                        color:            "#f38ba8"
+                        font.pixelSize:   13
+                    }
+
+                    MouseArea {
+                        id:            cancelArea
+                        anchors.fill:  parent
+                        hoverEnabled:  true
+                        onClicked:     client.send_ui_cancel()
+                    }
+                }
             }
         }
     }
