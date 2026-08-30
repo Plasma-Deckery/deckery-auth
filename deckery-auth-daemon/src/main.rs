@@ -111,12 +111,12 @@ enum DisplayEvent {
     Token(String),
     /// The last token was removed (Backspace).
     Backspace,
-    /// User confirmed — auth succeeding.
-    Confirm,
-    /// User cancelled — auth aborted.
-    Cancel,
-    /// Session ended (follows Confirm, Cancel, or error).
-    SessionEnd,
+    /// User confirmed — auth succeeding. Payload: session ID.
+    Confirm(u64),
+    /// User cancelled — auth aborted. Payload: session ID.
+    Cancel(u64),
+    /// Session ended (follows Confirm, Cancel, or error). Payload: session ID.
+    SessionEnd(u64),
 }
 
 impl DisplayEvent {
@@ -125,9 +125,9 @@ impl DisplayEvent {
             DisplayEvent::SessionStart(src, id) => format!("SESSION_START:{src}:{id}\n"),
             DisplayEvent::Token(t)          => format!("TOKEN:{t}\n"),
             DisplayEvent::Backspace         => "BACKSPACE\n".to_string(),
-            DisplayEvent::Confirm           => "CONFIRM\n".to_string(),
-            DisplayEvent::Cancel            => "CANCEL\n".to_string(),
-            DisplayEvent::SessionEnd        => "SESSION_END\n".to_string(),
+            DisplayEvent::Confirm(id)       => format!("CONFIRM:{id}\n"),
+            DisplayEvent::Cancel(id)        => format!("CANCEL:{id}\n"),
+            DisplayEvent::SessionEnd(id)    => format!("SESSION_END:{id}\n"),
         }
     }
 }
@@ -448,7 +448,7 @@ async fn worker_loop(
                     Ok(Some(pin)) => Response::Pin(pin),
                     Ok(None)      => Response::Cancel,
                     Err(e)        => {
-                        let _ = display_tx.send(DisplayEvent::SessionEnd);
+                        let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
                         Response::Error(e.to_string())
                     }
                 };
@@ -498,8 +498,8 @@ async fn collect_pin(
                 match token {
                     Token::Control(ControlAction::Confirm) => {
                         eprintln!("deckery-auth-daemon: Confirm — {} token(s)", tokens.len());
-                        let _ = display_tx.send(DisplayEvent::Confirm);
-                        let _ = display_tx.send(DisplayEvent::SessionEnd);
+                        let _ = display_tx.send(DisplayEvent::Confirm(session_id));
+                        let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
                         return Ok(Some(encode_sequence(&tokens)));
                     }
                     Token::Control(ControlAction::Backspace) => {
@@ -509,8 +509,8 @@ async fn collect_pin(
                     }
                     Token::Control(ControlAction::Cancel) => {
                         eprintln!("deckery-auth-daemon: Cancel (controller)");
-                        let _ = display_tx.send(DisplayEvent::Cancel);
-                        let _ = display_tx.send(DisplayEvent::SessionEnd);
+                        let _ = display_tx.send(DisplayEvent::Cancel(session_id));
+                        let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
                         return Ok(None);
                     }
                     Token::Release(_) => {
@@ -529,8 +529,8 @@ async fn collect_pin(
             Ok(id) = ui_cancel_rx.recv() => {
                 if id == session_id {
                     eprintln!("deckery-auth-daemon: Cancel (UI button, session {session_id})");
-                    let _ = display_tx.send(DisplayEvent::Cancel);
-                    let _ = display_tx.send(DisplayEvent::SessionEnd);
+                    let _ = display_tx.send(DisplayEvent::Cancel(session_id));
+                    let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
                     return Ok(None);
                 }
                 // Wrong session ID (stale cancel from a previous session) — ignore.

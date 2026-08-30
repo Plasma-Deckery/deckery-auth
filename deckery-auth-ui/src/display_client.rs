@@ -27,9 +27,12 @@ enum Event {
     SessionStart(String, u64),
     Token(String),
     Backspace,
-    Confirm,
-    Cancel,
-    SessionEnd,
+    /// Session ID — only the owning UI reacts.
+    Confirm(u64),
+    /// Session ID — only the owning UI reacts.
+    Cancel(u64),
+    /// Session ID — only the owning UI reacts.
+    SessionEnd(u64),
 }
 
 fn parse_line(line: &str) -> Option<Event> {
@@ -43,12 +46,12 @@ fn parse_line(line: &str) -> Option<Event> {
         Some(Event::Token(tok.to_owned()))
     } else if line == "BACKSPACE" {
         Some(Event::Backspace)
-    } else if line == "CONFIRM" {
-        Some(Event::Confirm)
-    } else if line == "CANCEL" {
-        Some(Event::Cancel)
-    } else if line == "SESSION_END" {
-        Some(Event::SessionEnd)
+    } else if let Some(id_str) = line.strip_prefix("CONFIRM:") {
+        Some(Event::Confirm(id_str.parse().ok()?))
+    } else if let Some(id_str) = line.strip_prefix("CANCEL:") {
+        Some(Event::Cancel(id_str.parse().ok()?))
+    } else if let Some(id_str) = line.strip_prefix("SESSION_END:") {
+        Some(Event::SessionEnd(id_str.parse().ok()?))
     } else {
         None  // unknown line — ignore
     }
@@ -170,11 +173,17 @@ impl ffi::DisplayClient {
                     self.as_mut().rust_mut().current_session_id = id;
                     self.as_mut().session_started(QString::from(&src));
                 }
-                Event::Token(t)  => self.as_mut().token_added(QString::from(&t)),
-                Event::Backspace => self.as_mut().backspace_pressed(),
-                Event::Confirm   => self.as_mut().confirmed(),
-                Event::Cancel    => self.as_mut().cancelled(),
-                Event::SessionEnd => self.as_mut().session_ended(),
+                Event::Token(t)   => self.as_mut().token_added(QString::from(&t)),
+                Event::Backspace  => self.as_mut().backspace_pressed(),
+                // Only react to closing events if they belong to our session.
+                Event::Confirm(id)    if id == self.rust().current_session_id
+                    => self.as_mut().confirmed(),
+                Event::Cancel(id)     if id == self.rust().current_session_id
+                    => self.as_mut().cancelled(),
+                Event::SessionEnd(id) if id == self.rust().current_session_id
+                    => self.as_mut().session_ended(),
+                // Wrong session ID — discard silently.
+                Event::Confirm(_) | Event::Cancel(_) | Event::SessionEnd(_) => {}
             }
         }
     }
