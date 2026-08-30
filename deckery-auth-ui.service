@@ -1,0 +1,16 @@
+[Unit]
+Description=Deckery controller PIN authentication UI
+Documentation=https://github.com/Plasma-Deckery/deckery-auth
+# Start after the Wayland compositor is up and the graphical session is ready.
+# PartOf ensures the UI is stopped when the graphical session ends.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/deckery-auth-ui
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target
