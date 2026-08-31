@@ -1,18 +1,20 @@
 //! `DisplayClient` — cxx-qt QObject that subscribes to the auth daemon's
-//! display socket and makes events accessible to QML.
+//! D-Bus display interface and makes events accessible to QML.
 //!
 //! Threading model
 //! ───────────────
-//! A background tokio thread reads lines from `display.sock` and pushes
-//! `Event` values into a `Mutex<VecDeque>`. QML calls `poll()` every 50 ms
-//! via a `Timer`; `poll()` drains the queue and emits the appropriate Qt
-//! signals on the main thread.
+//! A background tokio thread connects to the system bus, subscribes to
+//! `org.deckery.AuthDisplay1` signals, and pushes `Event` values into a
+//! `Mutex<VecDeque>`.  QML calls `poll()` every 50 ms via a `Timer`;
+//! `poll()` drains the queue and emits the appropriate Qt signals on the
+//! main thread.
 //!
-//! The socket is bidirectional: the daemon pushes events down and the UI
-//! can push "UI_CANCEL\n" back up (e.g. from the on-screen Cancel button).
-//! `send_ui_cancel()` is a synchronous invokable — it just calls
-//! `UnboundedSender::send`, which does not need a tokio runtime on the
-//! calling thread.
+//! UI-Cancel
+//! ─────────
+//! `send_ui_cancel()` is a synchronous invokable — it sends the session ID
+//! over a `tokio::sync::mpsc::UnboundedSender` to the background thread,
+//! which then calls the D-Bus method `UiCancel(session_id)` asynchronously.
+//! This keeps the Qt main thread non-blocking.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -35,26 +37,35 @@ enum Event {
     SessionEnd(u64),
 }
 
-fn parse_line(line: &str) -> Option<Event> {
-    if let Some(rest) = line.strip_prefix("SESSION_START:") {
-        // Format: SESSION_START:<source>:<session_id>
-        // Split on the last ':' so source names with ':' are handled safely.
-        let (src, id_str) = rest.rsplit_once(':')?;
-        let id = id_str.parse::<u64>().ok()?;
-        Some(Event::SessionStart(src.to_owned(), id))
-    } else if let Some(tok) = line.strip_prefix("TOKEN:") {
-        Some(Event::Token(tok.to_owned()))
-    } else if line == "BACKSPACE" {
-        Some(Event::Backspace)
-    } else if let Some(id_str) = line.strip_prefix("CONFIRM:") {
-        Some(Event::Confirm(id_str.parse().ok()?))
-    } else if let Some(id_str) = line.strip_prefix("CANCEL:") {
-        Some(Event::Cancel(id_str.parse().ok()?))
-    } else if let Some(id_str) = line.strip_prefix("SESSION_END:") {
-        Some(Event::SessionEnd(id_str.parse().ok()?))
-    } else {
-        None  // unknown line — ignore
-    }
+// ── D-Bus proxy ───────────────────────────────────────────────────────────────
+
+/// Auto-generated proxy for `org.deckery.AuthDisplay1`.
+#[zbus::proxy(
+    interface = "org.deckery.AuthDisplay1",
+    default_service = "org.deckery.AuthDisplay1",
+    default_path = "/org/deckery/AuthDisplay",
+)]
+trait AuthDisplay {
+    /// Request cancellation of the active session from the UI side.
+    async fn ui_cancel(&self, session_id: u64) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn session_start(&self, source: String, session_id: u64) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn token(&self, token: String) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn backspace(&self) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn confirm(&self, session_id: u64) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn cancel(&self, session_id: u64) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn session_end(&self, session_id: u64) -> zbus::Result<()>;
 }
 
 // ── Rust-side state ───────────────────────────────────────────────────────────
@@ -62,13 +73,12 @@ fn parse_line(line: &str) -> Option<Event> {
 pub struct DisplayClientRust {
     queue:              Arc<Mutex<VecDeque<Event>>>,
     started:            bool,
-    /// The session ID of the currently active auth session, as broadcast by
-    /// the daemon in SESSION_START.  Used to tag UI_CANCEL commands so the
-    /// daemon can ignore cancels that belong to a different session.
+    /// The session ID of the currently active auth session.
+    /// Used to tag UI_CANCEL commands so the daemon can ignore stale cancels.
     current_session_id: u64,
-    /// Sender half for outgoing commands to the daemon (e.g. "UI_CANCEL:<id>\n").
-    /// Set when the background reader connects, cleared on disconnect.
-    cmd_tx:             Arc<Mutex<Option<UnboundedSender<String>>>>,
+    /// Sender to background thread for UiCancel requests (carries session ID).
+    /// Set when connected to D-Bus, cleared on disconnect.
+    cmd_tx:             Arc<Mutex<Option<UnboundedSender<u64>>>>,
 }
 
 impl Default for DisplayClientRust {
@@ -124,22 +134,16 @@ pub mod ffi {
         #[qinvokable]
         fn poll(self: Pin<&mut DisplayClient>);
 
-        /// Send a UI-initiated cancel to the daemon.
-        /// Safe to call from QML (Qt main thread) — does not require tokio.
+        /// Send a UI-initiated cancel to the daemon via D-Bus.
+        /// Safe to call from QML (Qt main thread) — does not block.
         #[qinvokable]
         fn send_ui_cancel(self: Pin<&mut DisplayClient>);
     }
-
 }
 
 use core::pin::Pin;
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::QString;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::sync::mpsc;
-
-const DISPLAY_SOCKET: &str = "/run/deckery/display.sock";
 
 impl ffi::DisplayClient {
     fn start_listening(mut self: Pin<&mut Self>) {
@@ -168,83 +172,125 @@ impl ffi::DisplayClient {
         for event in events {
             match event {
                 Event::SessionStart(src, id) => {
-                    // Store session ID before emitting the signal so QML can
-                    // immediately call send_ui_cancel() with the correct ID.
                     self.as_mut().rust_mut().current_session_id = id;
                     self.as_mut().session_started(QString::from(&src));
                 }
                 Event::Token(t)   => self.as_mut().token_added(QString::from(&t)),
                 Event::Backspace  => self.as_mut().backspace_pressed(),
-                // Only react to closing events if they belong to our session.
-                Event::Confirm(id)    if id == self.rust().current_session_id
+                Event::Confirm(id) if id == self.rust().current_session_id
                     => self.as_mut().confirmed(),
-                Event::Cancel(id)     if id == self.rust().current_session_id
+                Event::Cancel(id) if id == self.rust().current_session_id
                     => self.as_mut().cancelled(),
                 Event::SessionEnd(id) if id == self.rust().current_session_id
                     => self.as_mut().session_ended(),
-                // Wrong session ID — discard silently.
                 Event::Confirm(_) | Event::Cancel(_) | Event::SessionEnd(_) => {}
             }
         }
     }
 
     fn send_ui_cancel(self: Pin<&mut Self>) {
-        // UnboundedSender::send is sync — no tokio runtime needed on caller thread.
         let id    = self.rust().current_session_id;
         let guard = self.rust().cmd_tx.lock().unwrap();
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.send(format!("UI_CANCEL:{id}\n"));
+            let _ = tx.send(id);
         }
         // If not connected yet, the cancel is silently ignored — nothing to abort.
     }
 }
 
+// ── Background D-Bus reader ───────────────────────────────────────────────────
+
+/// Continuously connects to the system bus, subscribes to
+/// `org.deckery.AuthDisplay1` signals, and pushes events into the queue.
+/// Retries automatically if the daemon is not yet running or the connection drops.
 async fn reader_loop(
     queue:  Arc<Mutex<VecDeque<Event>>>,
-    cmd_tx: Arc<Mutex<Option<UnboundedSender<String>>>>,
+    cmd_tx: Arc<Mutex<Option<UnboundedSender<u64>>>>,
 ) {
     loop {
-        match UnixStream::connect(DISPLAY_SOCKET).await {
+        match connect_and_listen(&queue, &cmd_tx).await {
+            Ok(()) => {
+                eprintln!("deckery-auth-ui: D-Bus connection ended, reconnecting…");
+            }
             Err(e) => {
-                eprintln!("deckery-auth-ui: {DISPLAY_SOCKET} unavailable ({e}), retrying in 2s");
+                eprintln!("deckery-auth-ui: D-Bus error ({e}), retrying in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            Ok(stream) => {
-                eprintln!("deckery-auth-ui: connected to {DISPLAY_SOCKET}");
+        }
+        *cmd_tx.lock().unwrap() = None;
+    }
+}
 
-                // Split into read (events from daemon) and write (commands to daemon).
-                let (read_half, mut write_half) = stream.into_split();
+async fn connect_and_listen(
+    queue:  &Arc<Mutex<VecDeque<Event>>>,
+    cmd_tx: &Arc<Mutex<Option<UnboundedSender<u64>>>>,
+) -> zbus::Result<()> {
+    use futures_util::StreamExt;
 
-                // Channel for UI-initiated commands (from Qt main thread → write task).
-                let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-                *cmd_tx.lock().unwrap() = Some(tx);
+    let conn = zbus::Connection::system().await?;
+    eprintln!("deckery-auth-ui: connected to D-Bus system bus");
 
-                // Spawn a task that forwards outgoing commands to the socket.
-                tokio::spawn(async move {
-                    while let Some(cmd) = rx.recv().await {
-                        if write_half.write_all(cmd.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    }
-                });
+    let proxy = AuthDisplayProxy::new(&conn).await?;
+    eprintln!("deckery-auth-ui: subscribed to org.deckery.AuthDisplay1");
 
-                // Read incoming event lines from the daemon.
-                let mut lines = BufReader::new(read_half).lines();
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            if let Some(event) = parse_line(&line) {
-                                queue.lock().unwrap().push_back(event);
-                            }
-                        }
-                        _ => break,
-                    }
-                }
+    // Subscribe to all signals.
+    let mut session_starts = proxy.receive_session_start().await?;
+    let mut tokens         = proxy.receive_token().await?;
+    let mut backspaces     = proxy.receive_backspace().await?;
+    let mut confirms       = proxy.receive_confirm().await?;
+    let mut cancels        = proxy.receive_cancel().await?;
+    let mut session_ends   = proxy.receive_session_end().await?;
 
-                // Connection dropped — clear the sender so send_ui_cancel is a no-op.
-                *cmd_tx.lock().unwrap() = None;
-                eprintln!("deckery-auth-ui: disconnected, reconnecting…");
+    // Channel: Qt main thread → background thread for UiCancel calls.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    *cmd_tx.lock().unwrap() = Some(tx);
+
+    // Spawn a task that forwards UiCancel requests to the D-Bus method.
+    let proxy_cancel = proxy.clone();
+    tokio::spawn(async move {
+        while let Some(session_id) = rx.recv().await {
+            if let Err(e) = proxy_cancel.ui_cancel(session_id).await {
+                eprintln!("deckery-auth-ui: UiCancel D-Bus call failed: {e}");
             }
         }
+    });
+
+    loop {
+        tokio::select! {
+            Some(sig) = session_starts.next() => {
+                if let Ok(args) = sig.args() {
+                    queue.lock().unwrap().push_back(
+                        Event::SessionStart(args.source().to_string(), *args.session_id())
+                    );
+                }
+            }
+            Some(sig) = tokens.next() => {
+                if let Ok(args) = sig.args() {
+                    queue.lock().unwrap().push_back(Event::Token(args.token().to_string()));
+                }
+            }
+            Some(_) = backspaces.next() => {
+                queue.lock().unwrap().push_back(Event::Backspace);
+            }
+            Some(sig) = confirms.next() => {
+                if let Ok(args) = sig.args() {
+                    queue.lock().unwrap().push_back(Event::Confirm(*args.session_id()));
+                }
+            }
+            Some(sig) = cancels.next() => {
+                if let Ok(args) = sig.args() {
+                    queue.lock().unwrap().push_back(Event::Cancel(*args.session_id()));
+                }
+            }
+            Some(sig) = session_ends.next() => {
+                if let Ok(args) = sig.args() {
+                    queue.lock().unwrap().push_back(Event::SessionEnd(*args.session_id()));
+                }
+            }
+            // All signal streams ended → daemon disappeared or connection dropped.
+            else => break,
+        }
     }
+
+    Ok(())
 }

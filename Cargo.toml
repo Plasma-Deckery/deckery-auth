@@ -21,6 +21,8 @@ rand = "0.8"
 anyhow = "1"
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
 
 [patch.crates-io]
 # evdev 0.12.x upstream is missing BTN_GRIPL/GRIPR/GRIPL2/GRIPR2 (Steam Deck
