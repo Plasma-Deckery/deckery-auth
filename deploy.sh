@@ -62,9 +62,6 @@ DAEMON_SERVICE_INSTALL="/etc/systemd/system/deckery-auth-daemon.service"
 UI_BIN_INSTALL="/usr/local/bin/deckery-auth-ui"
 UI_SERVICE_SRC="$SCRIPT_DIR/deckery-auth-ui.service"
 UI_SERVICE_INSTALL="/etc/systemd/user/deckery-auth-ui.service"
-DBUS_POLICY_SRC="$SCRIPT_DIR/org.deckery.AuthDisplay1.conf"
-DBUS_POLICY_INSTALL="/etc/dbus-1/system.d/org.deckery.AuthDisplay1.conf"
-
 DECKERY_CONF_DIR="/etc/deckery"
 HASH_FILE="$DECKERY_CONF_DIR/pin.hash"
 HASH_BACKUP="$DECKERY_CONF_DIR/pin.hash.deploy-bak"
@@ -79,14 +76,6 @@ if [[ "$UNINSTALL" == true ]]; then
     echo ""
 
     sudo bash "$INSTALL_SCRIPT" --uninstall
-
-    echo "    removing D-Bus policy $DBUS_POLICY_INSTALL"
-    if [[ -f "$DBUS_POLICY_INSTALL" ]]; then
-        sudo rm "$DBUS_POLICY_INSTALL"
-        echo "    ✓ removed"
-    else
-        echo "    (not present — skipped)"
-    fi
 
     echo "    removing $DEV_PAM_SO"
     if [[ -f "$DEV_PAM_SO" ]]; then
@@ -337,14 +326,6 @@ echo "==> Smoke test passed ($PASS/2) ✓"
 echo ""
 echo "==> Activating PAM module"
 sudo bash "$INSTALL_SCRIPT" --so-path="$DEV_PAM_SO"
-
-# ── Install D-Bus policy ──────────────────────────────────────────────────────
-
-echo ""
-echo "==> Installing D-Bus policy"
-echo "    cp org.deckery.AuthDisplay1.conf -> $DBUS_POLICY_INSTALL"
-sudo cp "$DBUS_POLICY_SRC" "$DBUS_POLICY_INSTALL"
-echo "    ✓ policy installed"
 
 # ── Install daemon ────────────────────────────────────────────────────────────
 

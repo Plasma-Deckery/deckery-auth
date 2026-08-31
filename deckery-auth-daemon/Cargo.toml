@@ -15,4 +15,3 @@ deckery-input = { path = "../deckery-input" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }
-zbus = { workspace = true }

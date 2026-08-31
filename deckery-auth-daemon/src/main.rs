@@ -9,36 +9,27 @@
 //!
 //! ```text
 //!  pam_deckery.so (root, within PAM stack)
-//!       │  connect /run/deckery/auth.sock
-//!       │  send "<source>\n"   e.g. "sudo", "screenlock", "greeter"
-//!       │  blocking read until response (no timeout)
+//!       │  connect /run/deckery/auth.sock   (mode 0600 — root only)
+//!       │  send "<source>\n"
+//!       │  blocking read until response
 //!       ▼
 //!  deckery-auth-daemon (root, systemd service)
-//!       │  assigns priority from source name (table lives here — one place)
-//!       │  queues request; serves highest-priority first, FIFO within tier
-//!       │  when at head of queue:
-//!       │    TokenReader::open() → exclusive evdev grab + Lizard Mode
-//!       │    reads tokens until Confirm / Cancel / IO error
-//!       │    writes one response line, closes connection
+//!       │  priority queue, serves highest-priority first
+//!       │  TokenReader → exclusive evdev grab + Lizard Mode
+//!       │  reads tokens until Confirm / Cancel / IO error
 //!       │
-//!       │  Display events → D-Bus signals (org.deckery.AuthDisplay1)
-//!       │    deckery-auth-ui subscribes as a D-Bus client on the system bus
-//!       │    UI-Cancel → UiCancel() D-Bus method call → cancel channel
+//!       │  display.sock (mode 0666, but exe-verified)
+//!       │    on connect: SO_PEERCRED → PID → /proc/<pid>/exe
+//!       │    only DISPLAY_EXE_ALLOWLIST binaries are accepted
+//!       │    accepted clients receive event stream (bidirectional)
+//!       │    UI_CANCEL:<id> → cancel active session if IDs match
 //!       ▼
 //!  pam_deckery receives encoded PIN (or CANCEL / ERROR:…)
-//!  → verifies against /etc/deckery/pin.hash
 //! ```
 //!
-//! # Socket protocol (auth.sock — PAM side)
+//! # Auth socket protocol (auth.sock)
 //!
-//! One round-trip per connection, newline-delimited ASCII.
-//!
-//! **Client → daemon (one line, sent before blocking):**
-//! ```text
-//! sudo\n
-//! screenlock\n
-//! greeter\n
-//! ```
+//! **Client → daemon:** `<source>\n`  e.g. `sudo`, `screenlock`
 //!
 //! **Daemon → client:**
 //! | Response | Meaning |
@@ -47,30 +38,36 @@
 //! | `CANCEL\n` | Cancel pressed |
 //! | `ERROR:<msg>\n` | Controller unavailable or IO error |
 //!
-//! # D-Bus interface (display — UI side)
+//! # Display socket protocol (display.sock)
 //!
-//! Interface `org.deckery.AuthDisplay1` on the **system bus**.
-//! Object path `/org/deckery/AuthDisplay`.
-//! Policy file: `/usr/share/dbus-1/system.d/org.deckery.AuthDisplay1.conf`.
+//! **Daemon → UI (event lines):**
+//! ```text
+//! SESSION_START:<source>:<session_id>\n
+//! TOKEN:<encoded>\n
+//! BACKSPACE\n
+//! CONFIRM:<session_id>\n
+//! CANCEL:<session_id>\n
+//! SESSION_END:<session_id>\n
+//! ```
 //!
-//! **Signals (daemon → UI):**
-//! | Signal | Arguments | Meaning |
-//! |---|---|---|
-//! | `SessionStart` | `source: s, session_id: t` | New auth session |
-//! | `Token` | `token: s` | Chord token added |
-//! | `Backspace` | — | Last token removed |
-//! | `Confirm` | `session_id: t` | Confirmed, auth succeeding |
-//! | `Cancel` | `session_id: t` | Cancelled |
-//! | `SessionEnd` | `session_id: t` | Session closed |
+//! **UI → Daemon (command lines):**
+//! ```text
+//! UI_CANCEL:<session_id>\n
+//! ```
 //!
-//! **Methods (UI → daemon):**
-//! | Method | Arguments | Meaning |
-//! |---|---|---|
-//! | `UiCancel` | `session_id: t` | On-screen Cancel button pressed |
+//! # Display peer verification
+//!
+//! The display socket is world-readable (0666) so `deckery-auth-ui` (running
+//! as user) can connect. The daemon immediately reads `SO_PEERCRED` on every
+//! incoming connection and resolves `/proc/<pid>/exe` to verify the binary.
+//! Only paths listed in `DISPLAY_EXE_ALLOWLIST` are accepted; all others are
+//! closed without receiving any data.
+//!
+//! This provides process-level isolation: not just UID-level but binary-level.
+//! Root can read any process's `/proc/<pid>/exe`; the symlink is set by the
+//! kernel and cannot be faked by the connecting process.
 //!
 //! # Priority queue
-//!
-//! Lower number = served sooner.
 //!
 //! | Source | Priority |
 //! |---|---|
@@ -84,22 +81,30 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, oneshot, Mutex, Notify};
-use zbus::object_server::SignalContext;
 
 use deckery_input::{ControlAction, Token, TokenReader, encode_sequence};
 
-/// Root-only socket path for PAM connections. Mode 0600 enforced after bind.
-const SOCKET_PATH: &str = "/run/deckery/auth.sock";
+/// Root-only socket. PAM module connects here.
+const AUTH_SOCKET_PATH: &str = "/run/deckery/auth.sock";
+
+/// Display socket. World-readable but peer-verified (see [`verify_display_peer`]).
+const DISPLAY_SOCKET_PATH: &str = "/run/deckery/display.sock";
+
+/// Only these binaries may receive display events.
+/// Checked via SO_PEERCRED → /proc/<pid>/exe (resolved by root, not faked by peer).
+const DISPLAY_EXE_ALLOWLIST: &[&str] = &[
+    "/usr/local/bin/deckery-auth-ui",
+];
 
 // ── Display events ────────────────────────────────────────────────────────────
 
-/// Events emitted as D-Bus signals over `org.deckery.AuthDisplay1`.
 #[derive(Debug, Clone)]
 enum DisplayEvent {
     SessionStart(String, u64),
@@ -110,62 +115,99 @@ enum DisplayEvent {
     SessionEnd(u64),
 }
 
-// ── D-Bus interface ───────────────────────────────────────────────────────────
-
-/// Implementation of `org.deckery.AuthDisplay1`.
-///
-/// Holds the sender end of the UI-cancel broadcast so the `UiCancel` method
-/// can forward the request to the active `collect_pin` call.
-struct AuthDisplayIface {
-    ui_cancel_tx: broadcast::Sender<u64>,
+impl DisplayEvent {
+    fn to_line(&self) -> String {
+        match self {
+            DisplayEvent::SessionStart(src, id) => format!("SESSION_START:{src}:{id}\n"),
+            DisplayEvent::Token(t)              => format!("TOKEN:{t}\n"),
+            DisplayEvent::Backspace             => "BACKSPACE\n".to_string(),
+            DisplayEvent::Confirm(id)           => format!("CONFIRM:{id}\n"),
+            DisplayEvent::Cancel(id)            => format!("CANCEL:{id}\n"),
+            DisplayEvent::SessionEnd(id)        => format!("SESSION_END:{id}\n"),
+        }
+    }
 }
 
-#[zbus::interface(name = "org.deckery.AuthDisplay1")]
-impl AuthDisplayIface {
-    /// Called by the UI when the on-screen Cancel button is pressed.
-    /// The session ID guards against stale cancels from a previous session.
-    async fn ui_cancel(&self, session_id: u64) {
-        eprintln!("deckery-auth-daemon: UI cancel via D-Bus (session {session_id})");
-        // Ignore send error: no active session means there is nothing to cancel.
-        let _ = self.ui_cancel_tx.send(session_id);
+// ── Display peer verification ─────────────────────────────────────────────────
+
+/// Returns `true` iff the peer of `stream` is running a binary in
+/// [`DISPLAY_EXE_ALLOWLIST`].
+///
+/// Reads `SO_PEERCRED` to obtain the peer PID (kernel-set, unforgeable), then
+/// resolves `/proc/<pid>/exe` as root. A `(deleted)` suffix is stripped — it
+/// appears when the binary is updated on disk while the process is still running,
+/// which is a normal occurrence during `deploy.sh`.
+fn verify_display_peer(stream: &tokio::net::UnixStream) -> bool {
+    let fd = stream.as_raw_fd();
+
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        eprintln!("deckery-auth-daemon: SO_PEERCRED failed on display connect");
+        return false;
     }
 
-    // ── Signals ───────────────────────────────────────────────────────────────
-    // Signal declarations: the daemon emits these; the UI subscribes.
+    let pid = cred.pid;
+    let exe_link = format!("/proc/{pid}/exe");
 
-    #[zbus(signal)]
-    async fn session_start(ctx: &SignalContext<'_>, source: &str, session_id: u64) -> zbus::Result<()>;
+    match std::fs::read_link(&exe_link) {
+        Err(e) => {
+            eprintln!("deckery-auth-daemon: display rejected: cannot read {exe_link}: {e}");
+            false
+        }
+        Ok(path) => {
+            let path_str = path.to_string_lossy();
+            // Strip kernel-appended " (deleted)" — appears when the binary is
+            // updated on disk (e.g. during deploy) while the process still runs.
+            let exe = path_str.trim_end_matches(" (deleted)");
 
-    #[zbus(signal)]
-    async fn token(ctx: &SignalContext<'_>, token: &str) -> zbus::Result<()>;
+            // /proc/<pid>/exe is always the *canonical* (symlink-resolved) path.
+            // Allowlist entries may contain symlinks (e.g. /usr/local → /var/usrlocal
+            // on Bazzite/Fedora Atomic). Canonicalise each allowlist entry before
+            // comparing so both sides are symlink-free real paths.
+            let allowed = DISPLAY_EXE_ALLOWLIST.iter().any(|&entry| {
+                if exe == entry {
+                    return true; // fast path: already matches verbatim
+                }
+                std::fs::canonicalize(entry)
+                    .map(|c| c.to_string_lossy() == exe)
+                    .unwrap_or(false)
+            });
 
-    #[zbus(signal)]
-    async fn backspace(ctx: &SignalContext<'_>) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn confirm(ctx: &SignalContext<'_>, session_id: u64) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn cancel(ctx: &SignalContext<'_>, session_id: u64) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn session_end(ctx: &SignalContext<'_>, session_id: u64) -> zbus::Result<()>;
+            if allowed {
+                eprintln!("deckery-auth-daemon: display accepted: {exe} (pid {pid})");
+                true
+            } else {
+                eprintln!("deckery-auth-daemon: display rejected: {exe} (pid {pid}) not in allowlist");
+                false
+            }
+        }
+    }
 }
 
 // ── Priority table ────────────────────────────────────────────────────────────
 
 fn priority_for_source(source: &str) -> u8 {
     match source {
-        "greeter"    => 0,
-        "screenlock" => 1,
-        "polkit"     => 2,
+        "greeter"     => 0,
+        "screenlock"  => 1,
+        "polkit"      => 2,
         "sudo" | "su" => 3,
-        "login"      => 4,
-        _            => 10,
+        "login"       => 4,
+        _             => 10,
     }
 }
 
-// ── Queue entry ───────────────────────────────────────────────────────────────
+// ── Queue ─────────────────────────────────────────────────────────────────────
 
 struct QueueEntry {
     priority: u8,
@@ -180,11 +222,9 @@ impl Ord for QueueEntry {
             .then(other.sequence.cmp(&self.sequence))
     }
 }
-impl PartialOrd for QueueEntry { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-impl PartialEq  for QueueEntry { fn eq(&self, other: &Self) -> bool { self.priority == other.priority && self.sequence == other.sequence } }
+impl PartialOrd for QueueEntry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+impl PartialEq  for QueueEntry { fn eq(&self, o: &Self) -> bool { self.priority == o.priority && self.sequence == o.sequence } }
 impl Eq for QueueEntry {}
-
-// ── Shared queue ──────────────────────────────────────────────────────────────
 
 struct Queue {
     heap:     BinaryHeap<QueueEntry>,
@@ -205,13 +245,7 @@ impl Queue {
     fn len(&self) -> usize { self.heap.len() }
 }
 
-// ── Response type ─────────────────────────────────────────────────────────────
-
-enum Response {
-    Pin(String),
-    Cancel,
-    Error(String),
-}
+enum Response { Pin(String), Cancel, Error(String) }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -221,154 +255,139 @@ async fn main() -> Result<()> {
         anyhow::bail!("deckery-auth-daemon must run as root");
     }
 
-    tokio::fs::create_dir_all("/run/deckery")
-        .await
-        .context("create /run/deckery")?;
-    let _ = tokio::fs::remove_file(SOCKET_PATH).await;
+    tokio::fs::create_dir_all("/run/deckery").await.context("create /run/deckery")?;
 
-    let listener = UnixListener::bind(SOCKET_PATH)
-        .with_context(|| format!("bind {SOCKET_PATH}"))?;
-    std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {SOCKET_PATH}"))?;
+    let _ = tokio::fs::remove_file(AUTH_SOCKET_PATH).await;
+    let listener = UnixListener::bind(AUTH_SOCKET_PATH)
+        .with_context(|| format!("bind {AUTH_SOCKET_PATH}"))?;
+    std::fs::set_permissions(AUTH_SOCKET_PATH, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 600 {AUTH_SOCKET_PATH}"))?;
 
-    println!("deckery-auth-daemon: listening on {SOCKET_PATH}");
+    println!("deckery-auth-daemon: listening on {AUTH_SOCKET_PATH}");
 
     let queue  = Arc::new(Mutex::new(Queue::new()));
     let notify = Arc::new(Notify::new());
 
-    // Internal broadcast for display events (capacity 64).
     let (display_tx, _) = broadcast::channel::<DisplayEvent>(64);
-
-    // UI-cancel broadcast (carries session ID).
     let (ui_cancel_tx, _) = broadcast::channel::<u64>(4);
 
     tokio::spawn(worker_loop(queue.clone(), notify.clone(), display_tx.clone(), ui_cancel_tx.clone()));
-    tokio::spawn(dbus_display_loop(display_tx, ui_cancel_tx));
-    accept_loop(listener, queue, notify).await;
+    tokio::spawn(display_accept_loop(display_tx, ui_cancel_tx));
+    auth_accept_loop(listener, queue, notify).await;
 
     Ok(())
 }
 
-// ── D-Bus display loop ────────────────────────────────────────────────────────
+// ── Display socket ────────────────────────────────────────────────────────────
 
-/// Owns the `org.deckery.AuthDisplay1` D-Bus name, forwards internal broadcast
-/// events as D-Bus signals, and receives `UiCancel` method calls from the UI.
-///
-/// If D-Bus setup fails (e.g. policy file not yet installed), the daemon logs
-/// the error and continues without UI display. The PAM auth flow is unaffected.
-async fn dbus_display_loop(
+async fn display_accept_loop(
     display_tx:   broadcast::Sender<DisplayEvent>,
     ui_cancel_tx: broadcast::Sender<u64>,
 ) {
-    if let Err(e) = run_dbus_display(display_tx, ui_cancel_tx).await {
-        eprintln!("deckery-auth-daemon: D-Bus display service failed: {e}");
-        eprintln!("  hint: install org.deckery.AuthDisplay1.conf to /usr/share/dbus-1/system.d/");
-    }
-}
+    let _ = tokio::fs::remove_file(DISPLAY_SOCKET_PATH).await;
+    let listener = match UnixListener::bind(DISPLAY_SOCKET_PATH) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("deckery-auth-daemon: cannot bind display socket: {e}");
+            return;
+        }
+    };
+    // 0666: the user-space UI needs to connect.
+    // Actual access control is done by verify_display_peer().
+    let _ = std::fs::set_permissions(
+        DISPLAY_SOCKET_PATH,
+        std::fs::Permissions::from_mode(0o666),
+    );
+    eprintln!("deckery-auth-daemon: display socket at {DISPLAY_SOCKET_PATH} (exe-verified)");
 
-async fn run_dbus_display(
-    display_tx:   broadcast::Sender<DisplayEvent>,
-    ui_cancel_tx: broadcast::Sender<u64>,
-) -> Result<()> {
-    let iface = AuthDisplayIface { ui_cancel_tx };
-
-    let conn = zbus::connection::Builder::system()
-        .context("D-Bus system bus connect")?
-        .name("org.deckery.AuthDisplay1")
-        .context("D-Bus name request")?
-        .serve_at("/org/deckery/AuthDisplay", iface)
-        .context("D-Bus serve_at")?
-        .build()
-        .await
-        .context("D-Bus connection build")?;
-
-    let ctx = SignalContext::new(&conn, "/org/deckery/AuthDisplay")
-        .context("D-Bus signal context")?;
-
-    eprintln!("deckery-auth-daemon: D-Bus service ready (org.deckery.AuthDisplay1)");
-
-    let mut rx = display_tx.subscribe();
     loop {
-        match rx.recv().await {
-            Ok(ev) => {
-                let result = match &ev {
-                    DisplayEvent::SessionStart(src, id) =>
-                        AuthDisplayIface::session_start(&ctx, src, *id).await,
-                    DisplayEvent::Token(t) =>
-                        AuthDisplayIface::token(&ctx, t).await,
-                    DisplayEvent::Backspace =>
-                        AuthDisplayIface::backspace(&ctx).await,
-                    DisplayEvent::Confirm(id) =>
-                        AuthDisplayIface::confirm(&ctx, *id).await,
-                    DisplayEvent::Cancel(id) =>
-                        AuthDisplayIface::cancel(&ctx, *id).await,
-                    DisplayEvent::SessionEnd(id) =>
-                        AuthDisplayIface::session_end(&ctx, *id).await,
-                };
-                if let Err(e) = result {
-                    eprintln!("deckery-auth-daemon: D-Bus signal error: {e}");
+        match listener.accept().await {
+            Err(e) => eprintln!("deckery-auth-daemon: display accept error: {e}"),
+            Ok((stream, _)) => {
+                // Verify binary identity before handing off.
+                if !verify_display_peer(&stream) {
+                    // Connection is dropped here; peer receives EOF.
+                    continue;
                 }
+                let rx = display_tx.subscribe();
+                tokio::spawn(handle_display_connection(stream, rx, ui_cancel_tx.clone()));
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                eprintln!("deckery-auth-daemon: D-Bus display lagged ({n} events dropped)");
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-
-    Ok(())
 }
 
-// ── PAM acceptor ─────────────────────────────────────────────────────────────
+/// Forwards display events to a verified frontend and reads back UI_CANCEL commands.
+async fn handle_display_connection(
+    stream:       UnixStream,
+    mut rx:       broadcast::Receiver<DisplayEvent>,
+    ui_cancel_tx: broadcast::Sender<u64>,
+) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut incoming = BufReader::new(read_half).lines();
 
-async fn accept_loop(
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(ev) => {
+                        if write_half.write_all(ev.to_line().as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("deckery-auth-daemon: display client lagged ({n} events dropped)");
+                    }
+                }
+            }
+            line = incoming.next_line() => {
+                match line {
+                    Ok(Some(l)) if l.trim().starts_with("UI_CANCEL:") => {
+                        let id_str = l.trim().strip_prefix("UI_CANCEL:").unwrap_or("");
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            eprintln!("deckery-auth-daemon: UI cancel (session {id})");
+                            let _ = ui_cancel_tx.send(id);
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+// ── Auth acceptor ─────────────────────────────────────────────────────────────
+
+async fn auth_accept_loop(
     listener: UnixListener,
     queue:    Arc<Mutex<Queue>>,
     notify:   Arc<Notify>,
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
-                let queue  = queue.clone();
-                let notify = notify.clone();
-                tokio::spawn(handle_incoming(stream, queue, notify));
-            }
-            Err(e) => eprintln!("deckery-auth-daemon: accept error: {e}"),
-        }
+            Ok((stream, _)) => tokio::spawn(handle_incoming(stream, queue.clone(), notify.clone())),
+            Err(e)          => { eprintln!("deckery-auth-daemon: accept error: {e}"); continue; }
+        };
     }
 }
 
-async fn handle_incoming(
-    mut stream: UnixStream,
-    queue:      Arc<Mutex<Queue>>,
-    notify:     Arc<Notify>,
-) {
+async fn handle_incoming(mut stream: UnixStream, queue: Arc<Mutex<Queue>>, notify: Arc<Notify>) {
     let source = {
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
         match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => {
-                let _ = stream.write_all(b"ERROR:read source\n").await;
-                return;
-            }
-            Ok(_) => line.trim().to_string(),
+            Ok(0) | Err(_) => { let _ = stream.write_all(b"ERROR:read source\n").await; return; }
+            Ok(_)          => line.trim().to_string(),
         }
     };
 
     let priority = priority_for_source(&source);
-
     let (response_tx, response_rx) = oneshot::channel::<Response>();
-    let queue_len = {
-        let mut q = queue.lock().await;
-        q.push(source.clone(), response_tx);
-        q.len()
-    };
+    let queue_len = { let mut q = queue.lock().await; q.push(source.clone(), response_tx); q.len() };
     notify.notify_one();
 
-    eprintln!(
-        "deckery-auth-daemon: queued '{}' (priority {}) — {} request(s) in queue",
-        source, priority, queue_len
-    );
+    eprintln!("deckery-auth-daemon: queued '{source}' (priority {priority}) — {queue_len} request(s)");
 
     let response = match response_rx.await {
         Ok(r)  => r,
@@ -393,34 +412,21 @@ async fn worker_loop(
     let mut next_session_id: u64 = 0;
     loop {
         let entry = { let mut q = queue.lock().await; q.pop() };
-
         match entry {
             None => { notify.notified().await; }
             Some(entry) => {
                 if entry.response.is_closed() {
-                    eprintln!(
-                        "deckery-auth-daemon: '{}' request abandoned (client disconnected)",
-                        entry.source
-                    );
+                    eprintln!("deckery-auth-daemon: '{}' abandoned (client disconnected)", entry.source);
                     continue;
                 }
-
-                eprintln!(
-                    "deckery-auth-daemon: serving '{}' (priority {})",
-                    entry.source, entry.priority
-                );
-
+                eprintln!("deckery-auth-daemon: serving '{}' (priority {})", entry.source, entry.priority);
                 let session_id = next_session_id;
                 next_session_id += 1;
                 let response = match collect_pin(&entry.source, &display_tx, &ui_cancel_tx, session_id).await {
                     Ok(Some(pin)) => Response::Pin(pin),
                     Ok(None)      => Response::Cancel,
-                    Err(e)        => {
-                        let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                        Response::Error(e.to_string())
-                    }
+                    Err(e)        => { let _ = display_tx.send(DisplayEvent::SessionEnd(session_id)); Response::Error(e.to_string()) }
                 };
-
                 let _ = entry.response.send(response);
             }
         }
@@ -436,18 +442,10 @@ async fn collect_pin(
     session_id:   u64,
 ) -> Result<Option<String>> {
     let mut ui_cancel_rx = ui_cancel_tx.subscribe();
+    let mut reader = TokenReader::open().await.context("open controller")?;
 
-    let mut reader = TokenReader::open()
-        .await
-        .context("open controller")?;
-
-    eprintln!(
-        "deckery-auth-daemon: PIN collection started on {}",
-        reader.path().display()
-    );
-
+    eprintln!("deckery-auth-daemon: PIN collection on {}", reader.path().display());
     let _ = display_tx.send(DisplayEvent::SessionStart(source.to_string(), session_id));
-
     let mut tokens: Vec<Token> = Vec::new();
 
     loop {
@@ -481,10 +479,9 @@ async fn collect_pin(
                     }
                 }
             }
-
             Ok(id) = ui_cancel_rx.recv() => {
                 if id == session_id {
-                    eprintln!("deckery-auth-daemon: Cancel (UI button, session {session_id})");
+                    eprintln!("deckery-auth-daemon: Cancel (UI, session {session_id})");
                     let _ = display_tx.send(DisplayEvent::Cancel(session_id));
                     let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
                     return Ok(None);

@@ -1019,7 +1019,6 @@ dependencies = [
  "deckery-input",
  "libc",
  "tokio",
- "zbus 4.4.0",
 ]
 
 [[package]]
@@ -1031,9 +1030,7 @@ dependencies = [
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
- "futures-util",
  "tokio",
- "zbus 4.4.0",
 ]
 
 [[package]]
