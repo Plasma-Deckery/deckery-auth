@@ -1,91 +1,136 @@
 //! `pam_deckery.so` — PAM module authenticating against the Deckery controller
-//! PIN, independent of the user's login password.
+//! PIN via the running `deckery-auth-daemon`.
 //!
-//! ## Step 1 (current)
+//! # Responsibility
 //!
-//! No daemon, no popup, no controller input yet. The PIN is requested via the
-//! standard PAM conversation function (`PAM_PROMPT_ECHO_OFF`) — on a terminal
-//! this reads from stdin same as a password prompt would. This proves out the
-//! PAM stack wiring (registration, ordering, hash verification) before the
-//! Layer Shell daemon and controller input reader are added in later steps.
-//! See https://github.com/Plasma-Deckery/deckery/issues/19.
+//! This module has exactly one job: collect a PIN from the controller via the
+//! daemon and verify it against the stored argon2id hash.
 //!
-//! ## Stack placement
-//!
-//! Must be listed *before* `pam_unix.so` as `sufficient` so it is tried
-//! first — see the Step 1 write-up on deckery#19 for the reasoning:
+//! It does **not** implement a keyboard fallback. Keyboard fallback is handled
+//! by `pam_unix.so` at the PAM stack level:
 //!
 //! ```text
-//! auth  sufficient  pam_deckery.so
-//! auth  sufficient  pam_unix.so
+//! auth  sufficient  pam_deckery.so  source=sudo   # Controller PIN (this module)
+//! auth  sufficient  pam_unix.so                   # Keyboard password (PAM stack fallback)
 //! auth  required    pam_deny.so
 //! ```
+//!
+//! With `sufficient`, when this module returns `AUTHINFO_UNAVAIL` or `AUTH_ERR`,
+//! PAM moves on to `pam_unix.so` — which provides the keyboard prompt.
+//!
+//! # Return codes
+//!
+//! | Situation | Return code | PAM behaviour |
+//! |---|---|---|
+//! | Correct PIN | `SUCCESS` | Auth succeeds immediately |
+//! | No PIN hash stored | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
+//! | Daemon not running | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
+//! | User cancelled on controller | `AUTH_ERR` | Skip → pam_unix |
+//! | Wrong PIN | `AUTH_ERR` | Skip → pam_unix |
+//!
+//! # Source name
+//!
+//! Pass `source=<name>` as a module argument in `/etc/pam.d/`. The daemon owns
+//! the priority table — callers only declare their identity.
+//!
+//! Known source names: `greeter`, `screenlock`, `polkit`, `sudo`, `su`, `login`.
 
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
-use pamsm::{Pam, PamError, PamFlags, PamLibExt, PamMsgStyle, PamServiceModule};
+use pamsm::{Pam, PamError, PamFlags, PamServiceModule};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 
-/// Same path written by `deckery-pin-set`.
+/// Stored PIN hash path — written by `deckery-pin-set`, read here.
 const PIN_HASH_PATH: &str = "/etc/deckery/pin.hash";
+
+/// Auth daemon socket. Mode 0600, root-only; created by `deckery-auth-daemon`.
+const DAEMON_SOCKET: &str = "/run/deckery/auth.sock";
 
 struct PamDeckery;
 
 impl PamServiceModule for PamDeckery {
-    fn authenticate(pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
+    fn authenticate(_pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
+        // No PIN configured → skip this module, fall through to pam_unix.
         let stored_hash = match fs::read_to_string(PIN_HASH_PATH) {
             Ok(h) => h,
-            // No PIN configured yet — not an error, just skip this module
-            // and let the stack fall through to pam_unix.
             Err(_) => return PamError::AUTHINFO_UNAVAIL,
         };
 
-        let pin = match pamh.conv(Some("Deckery PIN: "), PamMsgStyle::PROMPT_ECHO_OFF) {
-            Ok(Some(pin)) => pin,
-            Ok(None) => return PamError::AUTH_ERR,
+        let source = parse_source(&args);
+        let pin = match collect_pin_from_daemon(&source) {
+            Ok(p)  => p,
             Err(e) => return e,
         };
 
-        let pin = match pin.to_str() {
-            Ok(s) => s,
-            Err(_) => return PamError::AUTH_ERR,
-        };
-
-        match verify_pin(pin, &stored_hash) {
-            Ok(true) => PamError::SUCCESS,
+        match verify_pin(&pin, &stored_hash) {
+            Ok(true)  => PamError::SUCCESS,
             Ok(false) => PamError::AUTH_ERR,
-            Err(_) => PamError::AUTH_ERR,
+            Err(_)    => PamError::AUTH_ERR,
         }
     }
 
-    /// Required, not decorative: `setcred` belongs to the same PAM group as
-    /// `authenticate` ("auth"). Applications like sudo call `pam_setcred()`
-    /// automatically right after a successful `pam_authenticate()`, as part
-    /// of the standard PAM flow. pamsm's default (unimplemented) behavior
-    /// for every trait method is `PamError::SERVICE_ERR` — so leaving this
-    /// out would make sudo fail *after* a correct PIN, once it tries to set
-    /// up credentials. We have no credentials to establish, so SUCCESS
-    /// (a no-op "nothing to do here") is the correct response.
+    /// Called by PAM right after a successful `authenticate`. We have no
+    /// credentials to establish, so this is a deliberate no-op.
     fn setcred(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
         PamError::SUCCESS
     }
 
-    /// Belongs to PAM's "account" group, not "auth" — since `pam_deckery.so`
-    /// is only registered under `auth` in /etc/pam.d/, this is never
-    /// actually invoked by our current stack config.
-    ///
-    /// Deliberately returns IGNORE, not SUCCESS. Unlike `setcred` (which runs
-    /// only after identity is already verified), account management *is* a
-    /// real security decision — expired accounts, locked accounts, forced
-    /// password changes. We have no opinion on any of that; returning
-    /// unconditional SUCCESS here would silently wave through those checks
-    /// if this module ever ended up in an `account` stack by mistake.
-    /// IGNORE tells PAM to disregard this module's verdict entirely,
-    /// regardless of whether it's `required`, `sufficient`, or `optional` —
-    /// it cannot short-circuit a stack the way SUCCESS could.
+    /// Account management — we have no opinion, so we ignore unconditionally.
+    /// Returning IGNORE prevents this module from short-circuiting an `account`
+    /// stack it was accidentally placed in.
     fn acct_mgmt(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
         PamError::IGNORE
     }
 }
+
+// ── PIN acquisition ───────────────────────────────────────────────────────────
+
+/// Extract the `source=<name>` module argument. Defaults to `"unknown"`.
+fn parse_source(args: &[String]) -> String {
+    args.iter()
+        .find_map(|a| a.strip_prefix("source="))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Connect to `deckery-auth-daemon` and wait for it to collect a PIN from the
+/// controller.
+///
+/// Returns:
+/// - `Ok(pin)` — daemon collected a PIN; caller should verify it.
+/// - `Err(AUTHINFO_UNAVAIL)` — daemon socket unreachable (daemon not running).
+///   PAM will skip this module and try the next one (`pam_unix.so`).
+/// - `Err(AUTH_ERR)` — daemon was reached but the user cancelled, the daemon
+///   returned an error, or the connection was lost. PAM will skip this module
+///   and try the next one.
+///
+/// There is **no read timeout** — the socket blocks until the daemon responds
+/// or the connection closes, exactly like a standard PAM prompt.
+fn collect_pin_from_daemon(source: &str) -> Result<String, PamError> {
+    // Connect fails → daemon not running → AUTHINFO_UNAVAIL so PAM tries pam_unix.
+    let mut stream = UnixStream::connect(DAEMON_SOCKET)
+        .map_err(|_| PamError::AUTHINFO_UNAVAIL)?;
+
+    // Send source name so the daemon can assign the right priority.
+    stream.write_all(format!("{source}\n").as_bytes())
+        .map_err(|_| PamError::AUTH_ERR)?;
+
+    // Block until daemon responds or connection closes.
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)
+        .map_err(|_| PamError::AUTH_ERR)?;
+
+    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+
+    if trimmed == "CANCEL" || trimmed.starts_with("ERROR:") || trimmed.is_empty() {
+        return Err(PamError::AUTH_ERR);
+    }
+
+    Ok(trimmed.to_string())
+}
+
+// ── Hash verification ─────────────────────────────────────────────────────────
 
 fn verify_pin(pin: &str, stored_hash: &str) -> anyhow::Result<bool> {
     let parsed_hash = PasswordHash::new(stored_hash.trim())

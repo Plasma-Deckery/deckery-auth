@@ -1,0 +1,31 @@
+[Unit]
+Description=Deckery controller PIN authentication daemon
+Documentation=https://github.com/Plasma-Deckery/deckery-auth
+# Start after udev has settled so the controller evdev node exists.
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/deckery-auth-daemon
+Restart=on-failure
+RestartSec=2s
+
+# Run as root — required for exclusive evdev grab (EVIOCGRAB) and hidraw access.
+User=root
+Group=root
+
+# /run/deckery/ is world-traversable so the user-owned frontend can reach
+# display.sock (0666). auth.sock remains 0600 — root-only regardless.
+RuntimeDirectory=deckery
+RuntimeDirectoryMode=0755
+
+# Basic hardening — the daemon needs raw device access, so we cannot
+# restrict PrivateDevices or ProtectKernelTunables.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/deckery /etc/deckery
+
+[Install]
+WantedBy=multi-user.target

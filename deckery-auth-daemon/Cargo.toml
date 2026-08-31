@@ -1,0 +1,17 @@
+[package]
+name = "deckery-auth-daemon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Controller PIN auth daemon — holds the evdev grab during auth and exposes a root-only Unix socket for pam_deckery"
+
+[[bin]]
+name = "deckery-auth-daemon"
+path = "src/main.rs"
+
+[dependencies]
+deckery-input = { path = "../deckery-input" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
