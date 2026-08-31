@@ -40,6 +40,7 @@ use pamsm::{Pam, PamError, PamFlags, PamServiceModule};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 /// Stored PIN hash path — written by `deckery-pin-set`, read here.
 const PIN_HASH_PATH: &str = "/etc/deckery/pin.hash";
@@ -105,21 +106,37 @@ fn parse_source(args: &[String]) -> String {
 ///   returned an error, or the connection was lost. PAM will skip this module
 ///   and try the next one.
 ///
-/// There is **no read timeout** — the socket blocks until the daemon responds
-/// or the connection closes, exactly like a standard PAM prompt.
+/// PIN entry timeout: 5 minutes. If the user hasn't confirmed a PIN within
+/// this window, PAM returns AUTHINFO_UNAVAIL and the stack falls through to
+/// pam_unix.so (keyboard password). The user can always cancel earlier via
+/// the UI or controller.
+const PIN_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn collect_pin_from_daemon(source: &str) -> Result<String, PamError> {
     // Connect fails → daemon not running → AUTHINFO_UNAVAIL so PAM tries pam_unix.
     let mut stream = UnixStream::connect(DAEMON_SOCKET)
         .map_err(|_| PamError::AUTHINFO_UNAVAIL)?;
 
+    // Read timeout: if the daemon never responds (hang, no input), fall through
+    // to pam_unix after 5 minutes rather than blocking forever.
+    stream.set_read_timeout(Some(PIN_TIMEOUT))
+        .map_err(|_| PamError::AUTH_ERR)?;
+
     // Send source name so the daemon can assign the right priority.
     stream.write_all(format!("{source}\n").as_bytes())
         .map_err(|_| PamError::AUTH_ERR)?;
 
-    // Block until daemon responds or connection closes.
+    // Block until daemon responds, connection closes, or timeout fires.
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)
-        .map_err(|_| PamError::AUTH_ERR)?;
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+               || e.kind() == std::io::ErrorKind::TimedOut => {
+            // Timeout → treat as unavailable, let pam_unix handle it.
+            return Err(PamError::AUTHINFO_UNAVAIL);
+        }
+        Err(_) => return Err(PamError::AUTH_ERR),
+    }
 
     let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
