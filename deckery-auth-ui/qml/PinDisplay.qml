@@ -174,7 +174,7 @@ ApplicationWindow {
                 // ── Hint ──────────────────────────────────────────────────────
                 Text {
                     Layout.fillWidth: true
-                    text:             "Press Start / ⊙ to confirm · Menu / ☰ to cancel"
+                    text:             "≡ confirm  ·  ⋯ cancel  ·  ⊞ delete"
                     color:            "#6c7086"
                     font.pixelSize:   11
                     horizontalAlignment: Text.AlignHCenter
@@ -182,7 +182,7 @@ ApplicationWindow {
                 }
 
                 // ── Cancel button (touch / mouse fallback) ─────────────────────
-                // The primary cancel path is the controller (Menu / ☰ button).
+                // The primary cancel path is the controller QAM (⋯) button.
                 // This button provides a pointer-device fallback — useful during
                 // development and on non-Steam-Deck targets.
                 Rectangle {
