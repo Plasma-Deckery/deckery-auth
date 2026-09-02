@@ -245,7 +245,21 @@ impl Queue {
     fn len(&self) -> usize { self.heap.len() }
 }
 
-enum Response { Pin(String), Cancel, Error(String) }
+enum Response {
+    Pin(String),
+    /// Hard cancel — pam_deckery returns PAM_ABORT, no keyboard fallback.
+    Cancel,
+    /// Soft cancel — pam_deckery returns AUTH_ERR, falls through to pam_unix.
+    SwitchKeyboard,
+    Error(String),
+}
+
+/// Outcome of a PIN collection session.
+enum PinOutcome {
+    Pin(String),
+    Cancel,
+    SwitchKeyboard,
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -268,11 +282,16 @@ async fn main() -> Result<()> {
     let queue  = Arc::new(Mutex::new(Queue::new()));
     let notify = Arc::new(Notify::new());
 
-    let (display_tx, _) = broadcast::channel::<DisplayEvent>(64);
-    let (ui_cancel_tx, _) = broadcast::channel::<u64>(4);
+    let (display_tx, _)    = broadcast::channel::<DisplayEvent>(64);
+    let (ui_cancel_tx, _)  = broadcast::channel::<u64>(4);
+    let (ui_switch_kb_tx, _) = broadcast::channel::<u64>(4);
 
-    tokio::spawn(worker_loop(queue.clone(), notify.clone(), display_tx.clone(), ui_cancel_tx.clone()));
-    tokio::spawn(display_accept_loop(display_tx, ui_cancel_tx));
+    // Tracks the currently active session so a reconnecting UI client can be
+    // sent SESSION_START immediately without waiting for the next event.
+    let active_session: Arc<Mutex<Option<(String, u64)>>> = Arc::new(Mutex::new(None));
+
+    tokio::spawn(worker_loop(queue.clone(), notify.clone(), display_tx.clone(), ui_cancel_tx.clone(), ui_switch_kb_tx.clone(), active_session.clone()));
+    tokio::spawn(display_accept_loop(display_tx, ui_cancel_tx, ui_switch_kb_tx, active_session));
     auth_accept_loop(listener, queue, notify).await;
 
     Ok(())
@@ -281,8 +300,10 @@ async fn main() -> Result<()> {
 // ── Display socket ────────────────────────────────────────────────────────────
 
 async fn display_accept_loop(
-    display_tx:   broadcast::Sender<DisplayEvent>,
-    ui_cancel_tx: broadcast::Sender<u64>,
+    display_tx:      broadcast::Sender<DisplayEvent>,
+    ui_cancel_tx:    broadcast::Sender<u64>,
+    ui_switch_kb_tx: broadcast::Sender<u64>,
+    active_session:  Arc<Mutex<Option<(String, u64)>>>,
 ) {
     let _ = tokio::fs::remove_file(DISPLAY_SOCKET_PATH).await;
     let listener = match UnixListener::bind(DISPLAY_SOCKET_PATH) {
@@ -310,7 +331,10 @@ async fn display_accept_loop(
                     continue;
                 }
                 let rx = display_tx.subscribe();
-                tokio::spawn(handle_display_connection(stream, rx, ui_cancel_tx.clone()));
+                // Snapshot active session *before* subscribing so we can
+                // replay SESSION_START if a session is already running.
+                let replay = { active_session.lock().await.clone() };
+                tokio::spawn(handle_display_connection(stream, rx, ui_cancel_tx.clone(), ui_switch_kb_tx.clone(), replay));
             }
         }
     }
@@ -318,12 +342,24 @@ async fn display_accept_loop(
 
 /// Forwards display events to a verified frontend and reads back UI_CANCEL commands.
 async fn handle_display_connection(
-    stream:       UnixStream,
-    mut rx:       broadcast::Receiver<DisplayEvent>,
-    ui_cancel_tx: broadcast::Sender<u64>,
+    stream:          UnixStream,
+    mut rx:          broadcast::Receiver<DisplayEvent>,
+    ui_cancel_tx:    broadcast::Sender<u64>,
+    ui_switch_kb_tx: broadcast::Sender<u64>,
+    replay:          Option<(String, u64)>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut incoming = BufReader::new(read_half).lines();
+
+    // If a session was already active when this client connected, replay
+    // SESSION_START so the overlay opens immediately.
+    if let Some((source, id)) = replay {
+        eprintln!("deckery-auth-daemon: replaying SESSION_START:{source}:{id} to reconnected display client");
+        let line = DisplayEvent::SessionStart(source, id).to_line();
+        if write_half.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+    }
 
     loop {
         tokio::select! {
@@ -347,6 +383,13 @@ async fn handle_display_connection(
                         if let Ok(id) = id_str.parse::<u64>() {
                             eprintln!("deckery-auth-daemon: UI cancel (session {id})");
                             let _ = ui_cancel_tx.send(id);
+                        }
+                    }
+                    Ok(Some(l)) if l.trim().starts_with("UI_SWITCH_KB:") => {
+                        let id_str = l.trim().strip_prefix("UI_SWITCH_KB:").unwrap_or("");
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            eprintln!("deckery-auth-daemon: UI switch-to-keyboard (session {id})");
+                            let _ = ui_switch_kb_tx.send(id);
                         }
                     }
                     Ok(Some(_)) => {}
@@ -395,25 +438,30 @@ async fn handle_incoming(mut stream: UnixStream, queue: Arc<Mutex<Queue>>, notif
     };
 
     match response {
-        Response::Pin(p)   => { let _ = stream.write_all(format!("{p}\n").as_bytes()).await; }
-        Response::Cancel   => { let _ = stream.write_all(b"CANCEL\n").await; }
-        Response::Error(e) => { let _ = stream.write_all(format!("ERROR:{e}\n").as_bytes()).await; }
+        Response::Pin(p)        => { let _ = stream.write_all(format!("{p}\n").as_bytes()).await; }
+        Response::Cancel        => { let _ = stream.write_all(b"CANCEL\n").await; }
+        Response::SwitchKeyboard => { let _ = stream.write_all(b"SWITCH_KB\n").await; }
+        Response::Error(e)      => { let _ = stream.write_all(format!("ERROR:{e}\n").as_bytes()).await; }
     }
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
 async fn worker_loop(
-    queue:        Arc<Mutex<Queue>>,
-    notify:       Arc<Notify>,
-    display_tx:   broadcast::Sender<DisplayEvent>,
-    ui_cancel_tx: broadcast::Sender<u64>,
+    queue:           Arc<Mutex<Queue>>,
+    notify:          Arc<Notify>,
+    display_tx:      broadcast::Sender<DisplayEvent>,
+    ui_cancel_tx:    broadcast::Sender<u64>,
+    ui_switch_kb_tx: broadcast::Sender<u64>,
+    active_session:  Arc<Mutex<Option<(String, u64)>>>,
 ) {
     let mut next_session_id: u64 = 0;
+    eprintln!("deckery-auth-daemon: worker_loop started");
     loop {
-        let entry = { let mut q = queue.lock().await; q.pop() };
+        let (entry, qlen) = { let mut q = queue.lock().await; let e = q.pop(); let l = q.len(); (e, l) };
+        eprintln!("deckery-auth-daemon: worker_loop tick: entry={} remaining={}", entry.is_some(), qlen);
         match entry {
-            None => { notify.notified().await; }
+            None => { eprintln!("deckery-auth-daemon: worker_loop: waiting for notify"); notify.notified().await; }
             Some(entry) => {
                 if entry.response.is_closed() {
                     eprintln!("deckery-auth-daemon: '{}' abandoned (client disconnected)", entry.source);
@@ -422,11 +470,14 @@ async fn worker_loop(
                 eprintln!("deckery-auth-daemon: serving '{}' (priority {})", entry.source, entry.priority);
                 let session_id = next_session_id;
                 next_session_id += 1;
-                let response = match collect_pin(&entry.source, &display_tx, &ui_cancel_tx, session_id).await {
-                    Ok(Some(pin)) => Response::Pin(pin),
-                    Ok(None)      => Response::Cancel,
-                    Err(e)        => { let _ = display_tx.send(DisplayEvent::SessionEnd(session_id)); Response::Error(e.to_string()) }
+                *active_session.lock().await = Some((entry.source.clone(), session_id));
+                let response = match collect_pin(&entry.source, &display_tx, &ui_cancel_tx, &ui_switch_kb_tx, session_id).await {
+                    Ok(PinOutcome::Pin(pin))    => Response::Pin(pin),
+                    Ok(PinOutcome::Cancel)      => Response::Cancel,
+                    Ok(PinOutcome::SwitchKeyboard) => Response::SwitchKeyboard,
+                    Err(e) => { eprintln!("deckery-auth-daemon: collect_pin error (session {session_id}): {e:#}"); let _ = display_tx.send(DisplayEvent::SessionEnd(session_id)); Response::Error(e.to_string()) }
                 };
+                *active_session.lock().await = None;
                 let _ = entry.response.send(response);
             }
         }
@@ -436,12 +487,14 @@ async fn worker_loop(
 // ── PIN collection ────────────────────────────────────────────────────────────
 
 async fn collect_pin(
-    source:       &str,
-    display_tx:   &broadcast::Sender<DisplayEvent>,
-    ui_cancel_tx: &broadcast::Sender<u64>,
-    session_id:   u64,
-) -> Result<Option<String>> {
-    let mut ui_cancel_rx = ui_cancel_tx.subscribe();
+    source:          &str,
+    display_tx:      &broadcast::Sender<DisplayEvent>,
+    ui_cancel_tx:    &broadcast::Sender<u64>,
+    ui_switch_kb_tx: &broadcast::Sender<u64>,
+    session_id:      u64,
+) -> Result<PinOutcome> {
+    let mut ui_cancel_rx    = ui_cancel_tx.subscribe();
+    let mut ui_switch_kb_rx = ui_switch_kb_tx.subscribe();
     let mut reader = TokenReader::open().await.context("open controller")?;
 
     eprintln!("deckery-auth-daemon: PIN collection on {}", reader.path().display());
@@ -457,7 +510,7 @@ async fn collect_pin(
                         eprintln!("deckery-auth-daemon: Confirm — {} token(s)", tokens.len());
                         let _ = display_tx.send(DisplayEvent::Confirm(session_id));
                         let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                        return Ok(Some(encode_sequence(&tokens)));
+                        return Ok(PinOutcome::Pin(encode_sequence(&tokens)));
                     }
                     Token::Control(ControlAction::Backspace) => {
                         tokens.pop();
@@ -468,7 +521,7 @@ async fn collect_pin(
                         eprintln!("deckery-auth-daemon: Cancel (controller)");
                         let _ = display_tx.send(DisplayEvent::Cancel(session_id));
                         let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                        return Ok(None);
+                        return Ok(PinOutcome::Cancel);
                     }
                     Token::Release(_) => {}
                     t @ Token::Chord(_) => {
@@ -484,7 +537,15 @@ async fn collect_pin(
                     eprintln!("deckery-auth-daemon: Cancel (UI, session {session_id})");
                     let _ = display_tx.send(DisplayEvent::Cancel(session_id));
                     let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                    return Ok(None);
+                    return Ok(PinOutcome::Cancel);
+                }
+            }
+            Ok(id) = ui_switch_kb_rx.recv() => {
+                if id == session_id {
+                    eprintln!("deckery-auth-daemon: Switch-to-keyboard (UI, session {session_id})");
+                    let _ = display_tx.send(DisplayEvent::Cancel(session_id));
+                    let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+                    return Ok(PinOutcome::SwitchKeyboard);
                 }
             }
         }

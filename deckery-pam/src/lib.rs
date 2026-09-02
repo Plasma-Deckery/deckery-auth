@@ -25,7 +25,7 @@
 //! | Correct PIN | `SUCCESS` | Auth succeeds immediately |
 //! | No PIN hash stored | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
 //! | Daemon not running | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
-//! | User cancelled on controller | `AUTH_ERR` | Skip → pam_unix |
+//! | User cancelled on controller | `MAXTRIES` | sudo/polkit give up, no retry |
 //! | Wrong PIN | `AUTH_ERR` | Skip → pam_unix |
 //!
 //! # Source name
@@ -102,9 +102,10 @@ fn parse_source(args: &[String]) -> String {
 /// - `Ok(pin)` — daemon collected a PIN; caller should verify it.
 /// - `Err(AUTHINFO_UNAVAIL)` — daemon socket unreachable (daemon not running).
 ///   PAM will skip this module and try the next one (`pam_unix.so`).
-/// - `Err(AUTH_ERR)` — daemon was reached but the user cancelled, the daemon
-///   returned an error, or the connection was lost. PAM will skip this module
-///   and try the next one.
+/// - `Err(MAXTRIES)` — user explicitly cancelled on the controller or via the UI.
+///   `sudo` and `polkit` treat MAXTRIES as "stop retrying" rather than "try again".
+/// - `Err(AUTH_ERR)` — daemon returned an error or the connection was lost.
+///   PAM skips this module and tries the next one (pam_unix keyboard fallback).
 ///
 /// PIN entry timeout: 5 minutes. If the user hasn't confirmed a PIN within
 /// this window, PAM returns AUTHINFO_UNAVAIL and the stack falls through to
@@ -140,7 +141,17 @@ fn collect_pin_from_daemon(source: &str) -> Result<String, PamError> {
 
     let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
-    if trimmed == "CANCEL" || trimmed.starts_with("ERROR:") || trimmed.is_empty() {
+    if trimmed == "CANCEL" {
+        // Hard cancel (QAM button / ✕): abort the entire PAM transaction.
+        // PAM_ABORT prevents pam_unix from running — no keyboard dialog appears.
+        return Err(PamError::ABORT);
+    }
+    if trimmed == "SWITCH_KB" {
+        // Soft cancel ("Switch to Password"): fall through to pam_unix so the
+        // keyboard password dialog appears.
+        return Err(PamError::AUTH_ERR);
+    }
+    if trimmed.starts_with("ERROR:") || trimmed.is_empty() {
         return Err(PamError::AUTH_ERR);
     }
 

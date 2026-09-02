@@ -122,9 +122,14 @@ pub mod ffi {
         #[qinvokable]
         fn poll(self: Pin<&mut DisplayClient>);
 
-        /// Send a UI-initiated cancel. Safe to call from QML (Qt main thread).
+        /// Hard cancel — aborts the entire auth session (no keyboard fallback).
         #[qinvokable]
         fn send_ui_cancel(self: Pin<&mut DisplayClient>);
+
+        /// Switch to keyboard password — cancels controller input and lets
+        /// pam_unix handle the rest (shows system password dialog).
+        #[qinvokable]
+        fn send_ui_switch_kb(self: Pin<&mut DisplayClient>);
     }
 }
 
@@ -164,6 +169,7 @@ impl ffi::DisplayClient {
         for event in events {
             match event {
                 Event::SessionStart(src, id) => {
+                    eprintln!("deckery-auth-ui: poll: SESSION_START src={src} id={id}");
                     self.as_mut().rust_mut().current_session_id = id;
                     self.as_mut().session_started(QString::from(&src));
                 }
@@ -185,6 +191,14 @@ impl ffi::DisplayClient {
         let guard = self.rust().cmd_tx.lock().unwrap();
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(format!("UI_CANCEL:{id}\n"));
+        }
+    }
+
+    fn send_ui_switch_kb(self: Pin<&mut Self>) {
+        let id    = self.rust().current_session_id;
+        let guard = self.rust().cmd_tx.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(format!("UI_SWITCH_KB:{id}\n"));
         }
     }
 }
@@ -225,6 +239,7 @@ async fn reader_loop(
                 loop {
                     match lines.next_line().await {
                         Ok(Some(line)) => {
+                            eprintln!("deckery-auth-ui: recv: {line}");
                             if let Some(event) = parse_line(&line) {
                                 queue.lock().unwrap().push_back(event);
                             }

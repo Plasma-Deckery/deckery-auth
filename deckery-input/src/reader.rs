@@ -18,8 +18,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 
 use deckery_controller::{
-    ControllerEvent, GrabbedHandle, HapticRequest, LizardModeHandle, LizardModeSuppression,
-    SteamDeckController,
+    ControllerEvent, HapticRequest, LizardModeHandle, LizardModeSuppression,
+    PadFrame, SteamDeckController,
 };
 
 use crate::{Button, ControlAction, Token};
@@ -70,14 +70,17 @@ fn key_to_control(key: Key) -> Option<ControlAction> {
 pub struct TokenReader {
     rx:           mpsc::Receiver<ControllerEvent>,
     path:         PathBuf,
-    /// RAII guard for the exclusive evdev grab acquired via the yield protocol.
-    /// Dropping it emits `GrabReleased` on the pre-established D-Bus connection
-    /// so yieldable sessions know they can re-grab. `None` when not grabbed.
-    _grab_handle: Option<GrabbedHandle>,
     /// Keeps Lizard Mode suppression alive. `None` in tests (no hardware).
     _lizard_mode: Option<LizardModeHandle>,
     /// Haptic feedback channel. `None` if no hidraw sibling was found.
     haptic_tx:    Option<mpsc::Sender<HapticRequest>>,
+    /// Keeps the PadFrame receiver alive when using the hidraw backend.
+    ///
+    /// The hidraw reader task exits as soon as the PadFrame receiver is dropped
+    /// (it treats that as "trackpad router gone"). We don't consume pad frames
+    /// here, but we must hold the receiver so the reader keeps running and
+    /// continues to forward controller events via `event_tx`.
+    _pad_rx:      Option<mpsc::Receiver<PadFrame>>,
     /// Buttons currently held down, in press order (oldest first).
     held:         Vec<Button>,
 }
@@ -90,13 +93,13 @@ impl TokenReader {
     /// Used in tests and by higher-level code that manages the hardware task
     /// separately. Lizard Mode suppression and haptics are not active.
     pub fn from_channel(rx: mpsc::Receiver<ControllerEvent>, path: PathBuf) -> Self {
-        Self { rx, path, _grab_handle: None, _lizard_mode: None, haptic_tx: None, held: Vec::new() }
+        Self { rx, path, _lizard_mode: None, haptic_tx: None, _pad_rx: None, held: Vec::new() }
     }
 
-    /// Find the Steam Deck controller, grab it exclusively, start Lizard Mode
-    /// suppression and hidraw tasks, and return a ready `TokenReader`.
+    /// Find the Steam Deck controller, start Lizard Mode suppression and
+    /// hidraw tasks, and return a ready `TokenReader`.
     pub async fn open() -> Result<Self, std::io::Error> {
-        let controller = SteamDeckController::find(/*yieldable=*/ false)
+        let controller = SteamDeckController::find()
             .ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "no Steam Deck controller found — is the controller connected?",
@@ -109,7 +112,6 @@ impl TokenReader {
         };
 
         let session = controller.start(
-            /*grab=*/ true,
             Arc::new(Notify::new()),
             Some(lizard_cfg),
         ).await?;
@@ -117,9 +119,9 @@ impl TokenReader {
         Ok(Self {
             rx:           session.event_rx,
             path,
-            _grab_handle: session.grab_handle,
             _lizard_mode: Some(session.lizard_mode),
             haptic_tx:    session.haptic_tx,
+            _pad_rx:      session.pad_rx,   // keep alive — hidraw reader exits if this drops
             held:         Vec::new(),
         })
     }
