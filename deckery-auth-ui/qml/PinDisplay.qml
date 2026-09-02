@@ -1,10 +1,4 @@
 // PinDisplay.qml — Steam Deck controller PIN entry overlay.
-//
-// Displays the Steam Deck front SVG with:
-//   · Token display centred in the Steam Deck's screen area
-//   · Coloured glows on the three action buttons (Menu/QAM/View)
-//   · Source label and status feedback
-//   · Keyboard-fallback toggle button
 
 import QtQuick
 import QtQuick.Controls
@@ -22,6 +16,7 @@ ApplicationWindow {
                                            | LayerShell.Window.AnchorLeft
                                            | LayerShell.Window.AnchorRight
     LayerShell.Window.keyboardInteractivity: LayerShell.Window.KeyboardInteractivityNone
+    LayerShell.Window.exclusionZone:         -1
 
     visible:    false
     color:      "transparent"
@@ -32,6 +27,7 @@ ApplicationWindow {
     property var    tokens:      []
     property string statusText:  ""
     property bool   finishing:   false
+    property bool   showTokens:  true
 
     // ── DisplayClient polling ─────────────────────────────────────────────────
     Timer {
@@ -44,11 +40,14 @@ ApplicationWindow {
         Component.onCompleted: client.start_listening()
 
         onSession_started: (source) => {
-            root.authSource = source
-            root.tokens     = []
-            root.statusText = ""
-            root.finishing  = false
-            root.visible    = true
+            console.log("SESSION_STARTED:", source)
+            hideTimer.stop()
+            root.authSource  = source
+            root.tokens      = []
+            root.statusText  = ""
+            root.finishing   = false
+            root.showTokens  = true
+            root.visible     = true
         }
         onToken_added:      (token) => { root.tokens = root.tokens.concat([token]) }
         onBackspace_pressed: {
@@ -66,14 +65,98 @@ ApplicationWindow {
     // ── Full-screen scrim ─────────────────────────────────────────────────────
     Rectangle {
         anchors.fill: parent
-        color: "#99000000"          // 60 % dark scrim
-        visible: root.visible
+        color:        "#99000000"
+        visible:      root.visible
+
+        // ── Cancel (✕) — top-right ────────────────────────────────────────────
+        Rectangle {
+            anchors.top:     parent.top
+            anchors.right:   parent.right
+            anchors.margins: 20
+            width:  36; height: 36; radius: 18
+            color:        xBtn.containsMouse ? "#50f38ba8" : "transparent"
+            border.color: "#f38ba8"; border.width: 1.5
+            visible: !root.finishing
+            Text {
+                width: parent.width; height: parent.height
+                text: "✕"; color: "#f38ba8"
+                font.pixelSize:      16
+                font.bold:           true
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment:   Text.AlignVCenter
+            }
+            MouseArea {
+                id: xBtn; anchors.fill: parent; hoverEnabled: true
+                onClicked: client.send_ui_cancel()
+            }
+        }
+
+        // ── "Deckery Auth" title — top-left, mirrors HUD style ───────────────────
+        Row {
+            anchors.top:         parent.top
+            anchors.left:        parent.left
+            anchors.topMargin:   18
+            anchors.leftMargin:  22
+            spacing:             7
+            visible:             !root.finishing
+
+            Text {
+                text:           "Deckery"
+                color:          "#ffffff"
+                font.family:    "Adwaita Sans"
+                font.pixelSize: 20
+            }
+            Text {
+                text:           "AUTH"
+                color:          "#ffffff"
+                opacity:        0.4
+                font.family:    "Adwaita Sans"
+                font.pixelSize: 17
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 1
+            }
+        }
+
+        // ── Main heading + switch button — above the deck graphic ─────────────
+        Column {
+            anchors.bottom:           deckView.top
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottomMargin:     14
+            spacing:                  10
+            visible:                  !root.finishing
+
+            // Main heading: "Authentication requested by SUDO"
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text:                "Authentication requested by " + root.authSource
+                color:               "#cdd6f4"
+                font.pixelSize:      22
+                font.bold:           true
+                font.capitalization: Font.AllUppercase
+                font.letterSpacing:  2
+            }
+
+            // Switch to Password
+            Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width:  180; height: 30; radius: 15
+                color:        kbBtn.containsMouse ? "#40cdd6f4" : "#201e1e2e"
+                border.color: "#585b70"; border.width: 1
+                Text {
+                    anchors.centerIn: parent
+                    text: "⌨  Switch to Password"
+                    color: "#cdd6f4"; font.pixelSize: 12
+                }
+                MouseArea {
+                    id: kbBtn; anchors.fill: parent; hoverEnabled: true
+                    onClicked: client.send_ui_switch_kb()
+                }
+            }
+        }
 
         // ── Steam Deck SVG with overlays ──────────────────────────────────────
         Item {
             id: deckView
-
-            // Fill ~85 % of the narrower screen dimension; cap at native SVG width
             property real svgNativeW: 1024
             property real svgNativeH: 414
             property real scale:      Math.min(parent.width  * 0.88 / svgNativeW,
@@ -82,7 +165,6 @@ ApplicationWindow {
             height: svgNativeH * scale
             anchors.centerIn: parent
 
-            // ── Steam Deck outline ────────────────────────────────────────────
             Image {
                 anchors.fill: parent
                 source:       "qrc:/qt/qml/org/deckery/authui/assets/steamdeckFront.svg"
@@ -93,175 +175,179 @@ ApplicationWindow {
             }
 
             // ── Button glows ──────────────────────────────────────────────────
-            // SVG button coords from deckery-hud callouts.py:
-            //   BTN_SELECT (View/⊞):  (121, 33)  → backspace
-            //   BTN_START  (Menu/≡):  (902, 33)  → confirm
-            //   BTN_BASE   (QAM/⋯):  (845, 289) → cancel
-
-            // View/⊞ — backspace — blue
             ButtonGlow {
                 svgX: 121; svgY: 33; scale_: deckView.scale
                 glowColor: "#89b4fa"; label: "⊞"
                 visible: root.tokens.length > 0 && !root.finishing
             }
-            // Menu/≡ — confirm — green
             ButtonGlow {
                 svgX: 902; svgY: 33; scale_: deckView.scale
                 glowColor: "#a6e3a1"; label: "≡"
                 visible: !root.finishing
             }
-            // QAM/⋯ — cancel — red
             ButtonGlow {
                 svgX: 845; svgY: 289; scale_: deckView.scale
                 glowColor: "#f38ba8"; label: "⋯"
                 visible: !root.finishing
             }
 
-            // ── Screen area overlay ───────────────────────────────────────────
-            // The Steam Deck's display sits between the thumbsticks.
-            // In SVG coords: x≈270–750, y≈20–285  (approximate — no IDs in SVG)
+            // ── Screen area — token boxes only ────────────────────────────────
+            // SVG inner screen rect: x=242.5, y=37, w=540.6, h=339.9
             Item {
                 id: screenArea
-                x:      270 * deckView.scale
-                y:       20 * deckView.scale
-                width:  480 * deckView.scale
-                height: 265 * deckView.scale
+                x:      242.5 * deckView.scale
+                y:       37   * deckView.scale
+                width:  540.6 * deckView.scale
+                height: 339.9 * deckView.scale
 
-                // Frosted card inside the screen boundary
+                // Subtle tint so tokens are readable over the SVG artwork
                 Rectangle {
                     anchors.fill: parent
-                    color:        "#CC1e1e2e"    // 80 % catppuccin base
-                    radius:       8 * deckView.scale
-                    border.color: "#44cdd6f4"
-                    border.width: 1
+                    color:        "#881e1e2e"
+                    radius:       6 * deckView.scale
                 }
 
-                ColumnLayout {
-                    anchors.fill:    parent
-                    anchors.margins: 10 * deckView.scale
-                    spacing:         6 * deckView.scale
+                // Eye toggle — top-right corner of screen area
+                Rectangle {
+                    anchors.top:         parent.top
+                    anchors.right:       parent.right
+                    anchors.topMargin:   6 * deckView.scale
+                    anchors.rightMargin: 6 * deckView.scale
+                    width:  Math.round(26 * deckView.scale)
+                    height: Math.round(26 * deckView.scale)
+                    radius: 4 * deckView.scale
+                    color:        eyeArea.containsMouse ? "#40cdd6f4" : "transparent"
+                    border.color: "#585b70"
+                    border.width: 1
+                    visible: !root.finishing
 
-                    // Source label
-                    Text {
-                        Layout.fillWidth:    true
-                        text:                root.authSource
-                        color:               "#89b4fa"
-                        font.pixelSize:      Math.round(11 * deckView.scale)
-                        font.capitalization: Font.AllUppercase
-                        font.letterSpacing:  2
-                        horizontalAlignment: Text.AlignHCenter
+                    // Eye drawn with plain Rectangles — always #cdd6f4
+                    Item {
+                        anchors.centerIn: parent
+                        width:  Math.round(18 * deckView.scale)
+                        height: Math.round(11 * deckView.scale)
+
+                        // Oval outline
+                        Rectangle {
+                            anchors.fill: parent
+                            color:        "transparent"
+                            border.color: "#cdd6f4"
+                            border.width: Math.max(1, Math.round(1.5 * deckView.scale))
+                            radius:       height / 2
+                        }
+                        // Pupil (open state)
+                        Rectangle {
+                            anchors.centerIn: parent
+                            visible: root.showTokens
+                            width:  Math.round(5 * deckView.scale)
+                            height: width
+                            radius: width / 2
+                            color:  "#cdd6f4"
+                        }
+                        // Strike-through (closed state)
+                        Rectangle {
+                            anchors.centerIn: parent
+                            visible: !root.showTokens
+                            width:   parent.width * 0.75
+                            height:  Math.max(1, Math.round(1.5 * deckView.scale))
+                            color:   "#cdd6f4"
+                            rotation: -18
+                        }
                     }
+                    MouseArea {
+                        id:           eyeArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked:    root.showTokens = !root.showTokens
+                    }
+                }
 
-                    // Token row — one glyph box per chord pressed
-                    Flow {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        spacing: Math.round(5 * deckView.scale)
-                        horizontalItemAlignment: Flow.AlignHCenter
+                // Token grid — top-left, grows with input, variable-width boxes
+                Flow {
+                    anchors.top:         parent.top
+                    anchors.left:        parent.left
+                    anchors.topMargin:   10 * deckView.scale
+                    anchors.leftMargin:  10 * deckView.scale
+                    width:   screenArea.width - 20 * deckView.scale
+                    spacing: Math.round(5 * deckView.scale)
 
-                        Repeater {
-                            model: Math.max(root.tokens.length + 1, 8)
+                    Repeater {
+                        model: root.tokens.length + 1
 
-                            Rectangle {
-                                property bool filled: index < root.tokens.length
-                                width:  Math.round(30 * deckView.scale)
-                                height: Math.round(30 * deckView.scale)
-                                radius: 4 * deckView.scale
-                                color:  filled ? "#313244" : "#181825"
-                                border.color: filled ? "#89b4fa" : "#313244"
-                                border.width: 1
+                        Rectangle {
+                            property bool   filled:   index < root.tokens.length
+                            // Map thin arrows → bold filled triangles
+                            property string rawTok:   filled ? root.tokens[index] : ""
+                            property string dispTok:  rawTok.replace("↑","▲").replace("↓","▼").replace("←","◀").replace("→","▶")
 
-                                Text {
-                                    anchors.centerIn: parent
-                                    text:             index < root.tokens.length
-                                                          ? root.tokens[index] : ""
-                                    color:            "#cdd6f4"
-                                    font.pixelSize:   Math.round(11 * deckView.scale)
-                                    font.family:      "monospace"
-                                }
+                            height: Math.round(28 * deckView.scale)
+                            // Width: text-driven with min/padding so empty box stays square
+                            width:  Math.max(
+                                        lbl.implicitWidth + Math.round(12 * deckView.scale),
+                                        Math.round(28 * deckView.scale))
+                            radius: 4 * deckView.scale
+                            color:        filled ? "#313244" : "#181825"
+                            border.color: filled ? "#89b4fa" : "#313244"
+                            border.width: 1
+
+                            Text {
+                                id:                  lbl
+                                anchors.centerIn:    parent
+                                text:                filled ? (root.showTokens ? dispTok : "●") : ""
+                                color:               "#cdd6f4"
+                                font.pixelSize:      Math.round(11 * deckView.scale)
+                                font.family:         "monospace"
+                                font.bold:           true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment:   Text.AlignVCenter
                             }
                         }
                     }
+                }
 
-                    // Status feedback (✓ / ✗) or hint
-                    Text {
-                        Layout.fillWidth:    true
-                        visible:             root.statusText !== ""
-                        text:                root.statusText
-                        color:               root.statusText === "✓" ? "#a6e3a1" : "#f38ba8"
-                        font.pixelSize:      Math.round(28 * deckView.scale)
-                        horizontalAlignment: Text.AlignHCenter
-                    }
-
-                    // Keyboard fallback button
-                    Rectangle {
-                        Layout.alignment:  Qt.AlignHCenter
-                        visible:           !root.finishing
-                        width:             Math.round(100 * deckView.scale)
-                        height:            Math.round(22 * deckView.scale)
-                        radius:            4 * deckView.scale
-                        color:             kbArea.containsMouse ? "#313244" : "#1e1e2e"
-                        border.color:      "#585b70"
-                        border.width:      1
-
-                        Text {
-                            anchors.centerIn: parent
-                            text:             "⌨  Keyboard"
-                            color:            "#6c7086"
-                            font.pixelSize:   Math.round(9 * deckView.scale)
-                        }
-                        MouseArea {
-                            id:            kbArea
-                            anchors.fill:  parent
-                            hoverEnabled:  true
-                            // TODO: signal daemon to cancel and fall through to pam_unix
-                            onClicked:     client.send_ui_cancel()
-                        }
-                    }
+                // ✓ / ✗ status — centred when finishing
+                Text {
+                    anchors.centerIn:    parent
+                    visible:             root.statusText !== ""
+                    text:                root.statusText
+                    color:               root.statusText === "✓" ? "#a6e3a1" : "#f38ba8"
+                    font.pixelSize:      Math.round(48 * deckView.scale)
+                    horizontalAlignment: Text.AlignHCenter
                 }
             }
         }
     }
 
-    // ── ButtonGlow component ──────────────────────────────────────────────────
-    // A coloured halo + label rendered at an SVG-coordinate button position.
+    // ── ButtonGlow inline component ───────────────────────────────────────────
     component ButtonGlow: Item {
-    property real   svgX:       0
-    property real   svgY:       0
-    property real   scale_:     1.0
-    property color  glowColor:  "#ffffff"
-    property string label:      ""
+        property real   svgX:      0
+        property real   svgY:      0
+        property real   scale_:    1.0
+        property color  glowColor: "#ffffff"
+        property string label:     ""
 
-    x:      svgX * scale_ - width  / 2
-    y:      svgY * scale_ - height / 2
-    width:  Math.round(28 * scale_)
-    height: Math.round(28 * scale_)
+        x:      svgX * scale_ - width  / 2
+        y:      svgY * scale_ - height / 2
+        width:  Math.round(28 * scale_)
+        height: Math.round(28 * scale_)
 
-    // Outer glow ring
-    Rectangle {
-        anchors.centerIn: parent
-        width:  parent.width  * 1.8
-        height: parent.height * 1.8
-        radius: width / 2
-        color:  "transparent"
-        border.color: Qt.rgba(glowColor.r, glowColor.g, glowColor.b, 0.35)
-        border.width: 2
+        Rectangle {
+            anchors.centerIn: parent
+            width: parent.width * 1.8; height: parent.height * 1.8
+            radius: width / 2; color: "transparent"
+            border.color: Qt.rgba(glowColor.r, glowColor.g, glowColor.b, 0.35)
+            border.width: 2
+        }
+        Rectangle {
+            anchors.fill: parent
+            radius: width / 2
+            color:        Qt.rgba(glowColor.r, glowColor.g, glowColor.b, 0.25)
+            border.color: glowColor; border.width: 1.5
+        }
+        Text {
+            anchors.centerIn: parent
+            text: label; color: glowColor
+            font.pixelSize: Math.round(9 * scale_); font.bold: true
+        }
     }
-    // Filled circle
-    Rectangle {
-        anchors.fill: parent
-        radius: width / 2
-        color:  Qt.rgba(glowColor.r, glowColor.g, glowColor.b, 0.25)
-        border.color: glowColor
-        border.width: 1.5
-    }
-    // Label
-    Text {
-        anchors.centerIn: parent
-        text:             label
-        color:            glowColor
-        font.pixelSize:   Math.round(9 * scale_)
-        font.bold:        true
-    }
-    }   // ButtonGlow
-}       // ApplicationWindow
+}

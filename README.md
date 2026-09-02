@@ -1,41 +1,82 @@
 # deckery-auth
 
-Controller-native authentication for the Steam Deck — a way to authenticate `sudo`, polkit, and the lock screen with a short PIN entered via the controller, instead of typing a keyboard password.
+Controller-native authentication for the Steam Deck — authenticate `sudo`, polkit, and the lock screen with a short PIN entered via the controller, instead of typing a keyboard password.
 
 Part of [Deckery](https://github.com/Plasma-Deckery/deckery). Design and implementation plan: [deckery#19](https://github.com/Plasma-Deckery/deckery/issues/19), parent epic [deckery#17](https://github.com/Plasma-Deckery/deckery/issues/17).
 
 ## Status
 
-**Step 1 (in progress):** PIN storage + `pam_deckery.so` proof of concept. No daemon, no popup, no controller input yet — the PIN is entered via the standard PAM conversation prompt (keyboard) to validate the PAM stack wiring before adding the UI layers.
+**Functional end-to-end.** All core components are implemented and working on Bazzite:
 
-The full staged plan:
+- Controller PIN entry via the Steam Deck hardware (face buttons, D-pad, shoulder buttons, triggers, back paddles)
+- Full-screen Layer Shell overlay (`deckery-auth-ui`) showing the Steam Deck graphic with live token display
+- Auth daemon (`deckery-auth-daemon`) managing session queuing, priority, and display events
+- PAM module (`pam_deckery.so`) integrating with `sudo`
+- Hard cancel (QAM / ✕ button) aborts the PAM transaction entirely — no keyboard fallback
+- "Switch to Password" falls through to `pam_unix.so` — shows the standard keyboard password prompt
+- Session replay: if the UI reconnects mid-session, the overlay reopens automatically
+- PIN hashed with argon2id; stored in `/etc/deckery/pin.hash`
 
-1. **PIN storage + `pam_deckery.so`** (current) — proves the PAM chain works end-to-end, keyboard input into the standard PAM prompt
-2. **`deckery-auth` daemon + Layer Shell popup** — visual PIN entry, still keyboard for now
-3. **`deckery-input-reader`** — controller replaces keyboard as the input source
-4. **Polish** — makima paused during auth, timeouts, retry limits, tested across sudo/polkit/lockscreen
+**Remaining work:**
 
-`deckery-lockscreen` (the kscreenlocker QML theme, [deckery#18](https://github.com/Plasma-Deckery/deckery/issues/18)) and `deckery-polkit` (the custom polkit agent, [deckery#20](https://github.com/Plasma-Deckery/deckery/issues/20)) are separate, optional UI improvements — the PAM module from Step 1 already covers lock screen and polkit authentication via PAM directly, without either of them.
-
-See [deckery#19](https://github.com/Plasma-Deckery/deckery/issues/19) and its comments for the full discussion.
+- Additional PAM stacks: polkit-1, kscreenlocker, su, login (tracked in [#13](https://github.com/Plasma-Deckery/deckery-auth/issues/13))
+- Session priority / preemption (screenlock should pre-empt sudo, tracked in [#11](https://github.com/Plasma-Deckery/deckery-auth/issues/11))
+- Polkit agent replacement — "Switch to Password" in that context requires in-overlay keyboard input (no pam_unix fallback available)
 
 ## Crates
 
-- **`crates/deckery-pin-set`** — a standalone CLI tool, run once with `sudo`, that sets the controller PIN (argon2id hash written to `/etc/deckery/pin.hash`). This is **not** part of the PAM module itself — it only shares the hash file convention with it. Supports `--stdin` for non-interactive use in automated tests (reads the PIN from stdin instead of `/dev/tty`).
-- **`crates/deckery-pam`** — the PAM module. Builds to `pam_deckery.so` (PAM modules follow the `pam_*.so` naming convention — e.g. `pam_unix.so`, `pam_google_authenticator.so` — so the compiled artifact keeps that prefix even though the crate/directory is named `deckery-pam` per Deckery's own naming convention).
-- **`crates/deckery-pam-test`** — a dev/CI-only binary that calls `pam_authenticate` against a named PAM service via raw `libpam` FFI. Used by `deploy.sh` to smoke-test the full PAM chain without touching `/etc/pam.d/sudo`. Takes `<service> <user> <pin>` as arguments, exits 0 on `PAM_SUCCESS`. **Not installed in production** — the RPM spec excludes this binary.
+| Crate | Description |
+|---|---|
+| `deckery-auth-daemon` | Auth daemon — manages controller sessions, display events, socket protocol |
+| `deckery-auth-ui` | Layer Shell overlay — QML UI showing the Steam Deck graphic and token display |
+| `deckery-input` | Controller event → auth token translation (`TokenReader`) |
+| `deckery-pam` | PAM module (`pam_deckery.so`) — collects PIN via daemon, verifies against argon2id hash |
+| `deckery-pam-test` | Dev/CI smoke-test binary — calls `pam_authenticate` without touching `/etc/pam.d/sudo` |
+| `deckery-pin-set` | One-time CLI tool to set the controller PIN (writes argon2id hash to `/etc/deckery/pin.hash`) |
 
-## How the PAM module works
+## Architecture
 
-`crates/deckery-pam/src/lib.rs` is the interface that `libpam` actually loads. The `pamsm::pam_module!(PamDeckery)` macro at the bottom generates the C ABI entry points (`pam_sm_authenticate`, `pam_sm_setcred`, etc.) that PAM calls via `dlopen()`. The `impl PamServiceModule for PamDeckery` block is the Rust-side implementation PAM dispatches into.
+```
+sudo / polkit / kscreenlocker
+        │
+   pam_deckery.so          ← PAM module: connects to daemon socket, waits for PIN
+        │  auth.sock
+   deckery-auth-daemon     ← daemon: owns controller, queues sessions, routes events
+        │  display.sock
+   deckery-auth-ui         ← Layer Shell overlay: shows token display, cancel/switch buttons
+```
 
-Three trait methods are implemented, each for a different reason:
+The daemon verifies connecting UI binaries via `SO_PEERCRED` + `/proc/<pid>/exe` before accepting display connections.
 
-- **`authenticate`** — the actual check. Reads the stored PIN hash, prompts via the standard PAM conversation function (`PAM_PROMPT_ECHO_OFF`, same mechanism a password prompt uses), and verifies the input against the hash with argon2id.
+## Socket protocol
 
-- **`setcred`** — required, not decorative. It belongs to the same PAM group as `authenticate` ("auth"). Applications like sudo call `pam_setcred()` automatically right after a successful `pam_authenticate()`, as part of the standard PAM flow, to set up session credentials. `pamsm`'s default (unimplemented) behavior for every trait method is `PamError::SERVICE_ERR` — leaving this unimplemented would make sudo fail *after* a correct PIN, once it tries to set up credentials. We have none to establish, so returning `SUCCESS` (a no-op "nothing to do here") is correct and safe: `setcred` only runs after identity is already verified, so it cannot grant access on its own.
+**`auth.sock`** (PAM → daemon, root-only):
+- PAM sends: `<source>\n` (e.g. `sudo\n`)
+- Daemon replies: `<pin>\n` | `CANCEL\n` | `SWITCH_KB\n` | `ERROR:<msg>\n`
 
-- **`acct_mgmt`** — belongs to PAM's "account" group, not "auth". Since `pam_deckery.so` is only registered under `auth` in `/etc/pam.d/`, this is never actually invoked by the intended stack config. It's implemented anyway, but deliberately returns `PamError::IGNORE`, not `SUCCESS`. Unlike `setcred`, account management *is* a real security decision (expired accounts, locked accounts, forced password changes) — returning unconditional `SUCCESS` here would silently wave through those checks if this module ever ended up in an `account` stack by mistake. `IGNORE` tells PAM to disregard this module's verdict entirely, regardless of whether it's `required`, `sufficient`, or `optional` — unlike `SUCCESS`, it cannot short-circuit a stack it has no business deciding.
+**`display.sock`** (daemon → UI, allowlisted binaries only):
+- Daemon sends: `SESSION_START:<source>:<id>\n`, `TOKEN:<token>\n`, `BACKSPACE\n`, `CONFIRM:<id>\n`, `CANCEL:<id>\n`, `SESSION_END:<id>\n`
+- UI sends: `UI_CANCEL:<id>\n`, `UI_SWITCH_KB:<id>\n`
+
+## PAM stack
+
+```
+auth  sufficient  pam_deckery.so  source=sudo
+auth  sufficient  pam_unix.so
+auth  required    pam_deny.so
+```
+
+PAM return codes from `pam_deckery.so`:
+
+| Situation | Return code | PAM behaviour |
+|---|---|---|
+| Correct PIN | `SUCCESS` | Auth succeeds immediately |
+| No PIN hash stored | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
+| Daemon not running | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
+| User cancelled (QAM / ✕) | `ABORT` | Entire PAM transaction aborted — no keyboard fallback |
+| "Switch to Password" pressed | `AUTH_ERR` | Skip → pam_unix (keyboard dialog appears) |
+| Wrong PIN | `AUTH_ERR` | Skip → pam_unix |
+| PIN entry timeout (5 min) | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
 
 ## Building and deploying
 
@@ -45,78 +86,29 @@ Three trait methods are implemented, each for a different reason:
 ./deploy.sh
 ```
 
-Builds all crates inside the `deckery` Arch distrobox (for glibc compatibility — see [glibc note](#glibc-compatibility)), installs `pam_deckery.so` to `/usr/local/lib/security/` (writable on Bazzite's immutable filesystem), writes `/etc/pam.d/deckery-test`, and runs a two-step smoke test:
+Builds all crates inside the `deckery` Arch distrobox (daemon, PAM, input), and `deckery-ui-build` Fedora 43 distrobox (Qt UI — matches host Qt 6.10.3). Installs to `/usr/local/`.
 
-1. Sets a temporary test PIN via `deckery-pin-set --stdin`
-2. Verifies correct PIN → `PAM_SUCCESS` and wrong PIN → auth failure via `deckery-pam-test`
-3. Restores the original `pin.hash` afterwards — the real PIN is never overwritten
-
-After a successful deploy, set your real PIN:
+Set your PIN once after installing:
 
 ```bash
 sudo ./target/release/deckery-pin-set
 ```
 
-### RPM (production)
-
-```bash
-./deploy.sh --mode=rpm
-```
-
-Build only — leaves artifacts in `target/release/` for the RPM build process. No files are copied, no system state is changed.
-
-### Manual build
-
-```bash
-cargo build --release
-```
-
-`deckery-pam` requires the `libpam` headers to be available at build time (via the `pamsm` crate's `libpam` feature). `deckery-pam-test` links `libpam` directly via `build.rs`.
-
 ### glibc compatibility
 
-Built in the Arch distrobox (glibc 2.43); host Bazzite has glibc 2.42. Verified via `objdump -T`: both `libpam_deckery.so` and `deckery-pin-set` require only symbols up to `GLIBC_2.34`, well below the host's version — no compatibility issue. `cargo zigbuild` is available as a future safeguard if a new dependency ever pulls in a newer symbol.
-
-## PAM stack
-
-`pam_deckery.so` must be listed **before** `pam_unix.so` as `sufficient`, so the controller PIN is tried first — ahead of, not instead of, the keyboard password:
-
-```
-auth  sufficient  pam_deckery.so
-auth  sufficient  pam_unix.so
-auth  required    pam_deny.so
-```
-
-Order matters here: PAM tries `sufficient` modules strictly in stack order, and the *first* module listed runs *first* — including its own prompt. Listing `pam_unix.so` first would show the terminal password prompt before the controller PIN ever gets a chance.
-
-Resulting behavior for e.g. `sudo`:
-
-- Typing `sudo <command>` triggers `pam_deckery.so` first — the PIN prompt appears immediately, no terminal password prompt yet.
-- Wrong PIN entries are retried within `pam_deckery`/the auth daemon itself (internal retry count, TBD in later steps).
-- If the PIN ultimately fails (or a later popup is dismissed/times out), PAM falls through to `pam_unix.so` in the same stack evaluation, which prompts for the normal keyboard password as a fallback.
-- sudo's own outer retry loop (`passwd_tries` in `/etc/sudoers`, default 3) re-runs the whole stack from the top on complete failure — so the PIN prompt can reappear more than once before the keyboard fallback is reached.
-
-Both auth paths remain fully functional side by side; the PIN is just tried first.
-
-## Why argon2id
-
-PIN hashes are stored with argon2id — the current OWASP-recommended default for password storage, memory-hard against GPU/ASIC cracking. Alternatives considered:
-
-| Algorithm | Notes |
-|---|---|
-| **argon2id** ✅ | OWASP's first-choice recommendation, winner of the Password Hashing Competition (2015) |
-| yescrypt | What Fedora/glibc actually uses for `/etc/shadow` (Bazzite is Fedora-based) — similar design goals, but far less mature Rust tooling |
-| scrypt | Also memory-hard, less commonly chosen today now that argon2 exists |
-| bcrypt | No memory-hardness, still acceptable at a high cost factor, but not the current best practice |
-| PBKDF2 | No memory-hardness — OWASP recommends it only where FIPS-140 compliance is required |
-
-Since PIN verification happens rarely and locally (not a high-throughput API), parameters are set well above the OWASP minimums — 64 MiB memory, 3 iterations, 4-way parallelism — with no noticeable UX cost.
+Built in the Arch distrobox (glibc 2.43); host Bazzite has glibc 2.42. Both `libpam_deckery.so` and `deckery-pin-set` require only symbols up to `GLIBC_2.34` — no compatibility issue.
 
 ## Security notes
 
 - The controller PIN is a separate secret from the user's login password. `pam_unix.so` remains fully functional as a fallback — nothing about the existing authentication path is removed or weakened.
-- `pam_deckery.so` is scoped to the `auth` PAM group only. It does not, and should not, appear in `account`, `session`, or `password` stacks — see the `acct_mgmt` note above for why that distinction matters.
-- `/etc/deckery/pin.hash` is written with `0600` permissions (root-only read/write).
+- `pam_deckery.so` is scoped to the `auth` PAM group only.
+- `/etc/deckery/pin.hash` is written with `0600` permissions (root-only).
+- The display socket (`display.sock`) only accepts connections from allowlisted binaries, verified via `SO_PEERCRED` and `/proc/<pid>/exe`.
+- Hard cancel returns `PAM_ABORT`, which prevents `pam_unix.so` from running — no keyboard dialog appears after an explicit cancel.
+
+## Why argon2id
+
+PIN hashes use argon2id — the current OWASP-recommended default for password storage, memory-hard against GPU/ASIC cracking. Parameters: 64 MiB memory, 3 iterations, 4-way parallelism — well above OWASP minimums, with no noticeable UX cost given how rarely PIN verification runs.
 
 ## License
 

@@ -1,0 +1,6 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/qt/qml/org/deckery/authui/assets">
+    <file alias="steamdeckFront.svg">steamdeckFront.svg</file>
+  </qresource>
+</RCC>
