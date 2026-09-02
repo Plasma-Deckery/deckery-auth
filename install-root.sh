@@ -131,8 +131,8 @@ echo "==> Configuring $PAM_SUDO"
 # Remove any existing pam_deckery line (old or new) and insert fresh
 sed -i '/pam_deckery/d' "$PAM_SUDO"
 # Insert after the #%PAM-1.0 header line
-sed -i "1a auth  sufficient  $DEV_PAM_SO  source=sudo" "$PAM_SUDO"
-echo "    inserted: auth sufficient $DEV_PAM_SO source=sudo"
+sed -i "1a auth  [success=done authinfo_unavail=ignore auth_err=ignore default=die]  $DEV_PAM_SO  source=sudo" "$PAM_SUDO"
+echo "    inserted: auth [success=done authinfo_unavail=ignore auth_err=ignore default=die] $DEV_PAM_SO source=sudo"
 
 # ── Daemon ─────────────────────────────────────────────────────────────────────
 

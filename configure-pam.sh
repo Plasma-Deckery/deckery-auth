@@ -56,7 +56,7 @@ fi
 # google-authenticator-libpam). Idempotent: skipped if already present.
 echo "    activating pam_deckery.so in /etc/pam.d/sudo"
 if ! grep -q "pam_deckery.so" /etc/pam.d/sudo 2>/dev/null; then
-    sed -i "/auth.*include.*system-auth/i auth  sufficient  $SO_PATH  source=sudo" /etc/pam.d/sudo
+    sed -i "/auth.*include.*system-auth/i auth  [success=done authinfo_unavail=ignore auth_err=ignore default=die]  $SO_PATH  source=sudo" /etc/pam.d/sudo
     echo "    ✓ added"
 else
     echo "    (already present — skipped)"
