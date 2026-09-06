@@ -116,12 +116,28 @@ impl TokenReader {
             Some(lizard_cfg),
         ).await?;
 
+        // The hidraw reader sends PadFrames via an mpsc channel (capacity 64).
+        // TokenReader doesn't use pad data, but must keep the receiver alive so
+        // the reader task doesn't exit.  Simply holding the receiver without
+        // reading it fills the channel after 64 unique pad states (< 1 s of
+        // sensor noise), after which every `tx.send().await` in the reader
+        // blocks — preventing button events from being synthesised at all.
+        //
+        // Fix: spawn a drain task that reads and discards frames continuously.
+        // This keeps the channel empty so the reader never stalls.  When
+        // `TokenReader` is dropped, `event_rx` is dropped → the reader exits on
+        // its next `event_tx.send(...).is_err()` → `frame_tx` is dropped → the
+        // drain task sees `None` from `recv()` and exits cleanly.
+        if let Some(mut pad_rx) = session.pad_rx {
+            tokio::spawn(async move { while pad_rx.recv().await.is_some() {} });
+        }
+
         Ok(Self {
             rx:           session.event_rx,
             path,
             _lizard_mode: Some(session.lizard_mode),
             haptic_tx:    session.haptic_tx,
-            _pad_rx:      session.pad_rx,   // keep alive — hidraw reader exits if this drops
+            _pad_rx:      None,   // drained by the task above; None is safe here
             held:         Vec::new(),
         })
     }

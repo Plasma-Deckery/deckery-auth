@@ -1,93 +1,97 @@
-//! `pam_deckery.so` — PAM module authenticating against the Deckery controller
-//! PIN via the running `deckery-auth-daemon`.
+//! `pam_deckery.so` — PAM module that authenticates via the running
+//! `deckery-auth-daemon`.
 //!
-//! # Responsibility
+//! # What this module does
 //!
-//! This module has exactly one job: collect a PIN from the controller via the
-//! daemon and verify it against the stored argon2id hash.
+//! It drives a **multi-turn** dialogue with the daemon over the auth socket:
 //!
-//! It does **not** implement a keyboard fallback. Keyboard fallback is handled
-//! by `pam_unix.so` at the PAM stack level:
+//! 1. Connect → send `source\n`.
+//! 2. Daemon sends an attempt: `PIN:<encoded>\n` or `KBD:<password>\n`.
+//! 3. This module verifies and replies `CORRECT\n` or `WRONG\n`.
+//! 4. On WRONG the daemon relays the failure to the UI (which shows ✗ and
+//!    lets the user retry); on CORRECT the session ends successfully.
+//! 5. `CANCEL\n` from the daemon aborts the entire PAM transaction.
+//!
+//! All verification happens here:
+//! - Controller PIN  → argon2id against `/etc/deckery/pin.hash`
+//! - Keyboard password → shadow/crypt against `/etc/shadow`
+//!
+//! # PAM stack
 //!
 //! ```text
-//! auth  sufficient  pam_deckery.so  source=sudo   # Controller PIN (this module)
-//! auth  sufficient  pam_unix.so                   # Keyboard password (PAM stack fallback)
+//! auth  sufficient  pam_deckery.so  source=sudo
+//! auth  sufficient  pam_unix.so                   # fallback when daemon unreachable
 //! auth  required    pam_deny.so
 //! ```
 //!
-//! With `sufficient`, when this module returns `AUTHINFO_UNAVAIL` or `AUTH_ERR`,
-//! PAM moves on to `pam_unix.so` — which provides the keyboard prompt.
-//!
 //! # Return codes
 //!
-//! | Situation | Return code | PAM behaviour |
-//! |---|---|---|
-//! | Correct PIN | `SUCCESS` | Auth succeeds immediately |
-//! | No PIN hash stored | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
-//! | Daemon not running | `AUTHINFO_UNAVAIL` | Skip → pam_unix |
-//! | User cancelled on controller | `MAXTRIES` | sudo/polkit give up, no retry |
-//! | Wrong PIN | `AUTH_ERR` | Skip → pam_unix |
-//!
-//! # Source name
-//!
-//! Pass `source=<name>` as a module argument in `/etc/pam.d/`. The daemon owns
-//! the priority table — callers only declare their identity.
-//!
-//! Known source names: `greeter`, `screenlock`, `polkit`, `sudo`, `su`, `login`.
+//! | Situation                           | Code               | PAM behaviour        |
+//! |-------------------------------------|--------------------|----------------------|
+//! | Correct PIN or password             | `SUCCESS`          | Auth succeeds        |
+//! | Daemon not running / timeout        | `AUTHINFO_UNAVAIL` | Skip → pam_unix      |
+//! | User cancelled (controller / UI ✕)  | `ABORT`            | No keyboard fallback |
+//! | Unexpected error                    | `AUTH_ERR`         | Skip → pam_unix      |
 
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
-use pamsm::{Pam, PamError, PamFlags, PamServiceModule};
+use pamsm::{Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
+use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-/// Stored PIN hash path — written by `deckery-pin-set`, read here.
+// crypt(3) is in libxcrypt on modern Fedora/Bazzite. Not always re-exported by
+// the `libc` crate, so we declare it explicitly. Linked via build.rs (-lcrypt).
+extern "C" {
+    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
+}
+
+/// Stored controller PIN hash — written by `deckery-pin-set`.
 const PIN_HASH_PATH: &str = "/etc/deckery/pin.hash";
 
-/// Auth daemon socket. Mode 0600, root-only; created by `deckery-auth-daemon`.
+/// Auth daemon socket — mode 0600 (root-only).
 const DAEMON_SOCKET: &str = "/run/deckery/auth.sock";
+
+/// Per-attempt read timeout. After this long with no input from the user,
+/// we fall through to `pam_unix.so`.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct PamDeckery;
 
 impl PamServiceModule for PamDeckery {
-    fn authenticate(_pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
-        // No PIN configured → skip this module, fall through to pam_unix.
-        let stored_hash = match fs::read_to_string(PIN_HASH_PATH) {
-            Ok(h) => h,
-            Err(_) => return PamError::AUTHINFO_UNAVAIL,
+    fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
+        // Load the stored PIN hash (empty string = no PIN configured; keyboard
+        // password mode still works via shadow verification).
+        let stored_hash = fs::read_to_string(PIN_HASH_PATH)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // Username is needed for shadow verification.
+        let username = match pamh.get_user(None) {
+            Ok(Some(u)) => u.to_string_lossy().to_string(),
+            _           => return PamError::AUTH_ERR,
         };
 
         let source = parse_source(&args);
-        let pin = match collect_pin_from_daemon(&source) {
-            Ok(p)  => p,
-            Err(e) => return e,
-        };
 
-        match verify_pin(&pin, &stored_hash) {
-            Ok(true)  => PamError::SUCCESS,
-            Ok(false) => PamError::AUTH_ERR,
-            Err(_)    => PamError::AUTH_ERR,
+        match run_auth_session(&source, &username, &stored_hash) {
+            Ok(())  => PamError::SUCCESS,
+            Err(e)  => e,
         }
     }
 
-    /// Called by PAM right after a successful `authenticate`. We have no
-    /// credentials to establish, so this is a deliberate no-op.
     fn setcred(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
         PamError::SUCCESS
     }
 
-    /// Account management — we have no opinion, so we ignore unconditionally.
-    /// Returning IGNORE prevents this module from short-circuiting an `account`
-    /// stack it was accidentally placed in.
     fn acct_mgmt(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
         PamError::IGNORE
     }
 }
 
-// ── PIN acquisition ───────────────────────────────────────────────────────────
+// ── Source parsing ────────────────────────────────────────────────────────────
 
-/// Extract the `source=<name>` module argument. Defaults to `"unknown"`.
 fn parse_source(args: &[String]) -> String {
     args.iter()
         .find_map(|a| a.strip_prefix("source="))
@@ -95,77 +99,119 @@ fn parse_source(args: &[String]) -> String {
         .to_string()
 }
 
-/// Connect to `deckery-auth-daemon` and wait for it to collect a PIN from the
-/// controller.
-///
-/// Returns:
-/// - `Ok(pin)` — daemon collected a PIN; caller should verify it.
-/// - `Err(AUTHINFO_UNAVAIL)` — daemon socket unreachable (daemon not running).
-///   PAM will skip this module and try the next one (`pam_unix.so`).
-/// - `Err(MAXTRIES)` — user explicitly cancelled on the controller or via the UI.
-///   `sudo` and `polkit` treat MAXTRIES as "stop retrying" rather than "try again".
-/// - `Err(AUTH_ERR)` — daemon returned an error or the connection was lost.
-///   PAM skips this module and tries the next one (pam_unix keyboard fallback).
-///
-/// PIN entry timeout: 5 minutes. If the user hasn't confirmed a PIN within
-/// this window, PAM returns AUTHINFO_UNAVAIL and the stack falls through to
-/// pam_unix.so (keyboard password). The user can always cancel earlier via
-/// the UI or controller.
-const PIN_TIMEOUT: Duration = Duration::from_secs(300);
+// ── Auth session ──────────────────────────────────────────────────────────────
 
-fn collect_pin_from_daemon(source: &str) -> Result<String, PamError> {
-    // Connect fails → daemon not running → AUTHINFO_UNAVAIL so PAM tries pam_unix.
+/// Connect to the daemon and run the multi-turn verification loop.
+///
+/// Protocol (one iteration per attempt):
+/// ```text
+/// → source\n
+/// ← PIN:<encoded>\n   → verify argon2 → CORRECT\n or WRONG\n
+/// ← KBD:<password>\n  → verify shadow → CORRECT\n or WRONG\n
+/// ← CANCEL\n          → return PAM_ABORT
+/// ← ERROR:<msg>\n     → return PAM_AUTH_ERR
+/// ```
+fn run_auth_session(
+    source:      &str,
+    username:    &str,
+    stored_hash: &str,
+) -> Result<(), PamError> {
     let mut stream = UnixStream::connect(DAEMON_SOCKET)
         .map_err(|_| PamError::AUTHINFO_UNAVAIL)?;
 
-    // Read timeout: if the daemon never responds (hang, no input), fall through
-    // to pam_unix after 5 minutes rather than blocking forever.
-    stream.set_read_timeout(Some(PIN_TIMEOUT))
+    // Per-attempt timeout: if the daemon sends nothing for 5 minutes,
+    // fall through to pam_unix.
+    stream.set_read_timeout(Some(ATTEMPT_TIMEOUT))
         .map_err(|_| PamError::AUTH_ERR)?;
 
-    // Send source name so the daemon can assign the right priority.
+    // Send source name.
     stream.write_all(format!("{source}\n").as_bytes())
         .map_err(|_| PamError::AUTH_ERR)?;
 
-    // Block until daemon responds, connection closes, or timeout fires.
-    let mut line = String::new();
-    match BufReader::new(stream).read_line(&mut line) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-               || e.kind() == std::io::ErrorKind::TimedOut => {
-            // Timeout → treat as unavailable, let pam_unix handle it.
-            return Err(PamError::AUTHINFO_UNAVAIL);
+    let mut reader = BufReader::new(
+        stream.try_clone().map_err(|_| PamError::AUTH_ERR)?,
+    );
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err(PamError::AUTH_ERR),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                   || e.kind() == std::io::ErrorKind::TimedOut
+                => return Err(PamError::AUTHINFO_UNAVAIL),
+            Err(_) => return Err(PamError::AUTH_ERR),
+            Ok(_)  => {}
         }
-        Err(_) => return Err(PamError::AUTH_ERR),
-    }
 
-    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        let msg = line.trim_end_matches(['\n', '\r']);
 
-    if trimmed == "CANCEL" {
-        // Hard cancel (QAM button / ✕): abort the entire PAM transaction.
-        // PAM_ABORT prevents pam_unix from running — no keyboard dialog appears.
-        return Err(PamError::ABORT);
-    }
-    if trimmed == "SWITCH_KB" {
-        // Soft cancel ("Switch to Password"): fall through to pam_unix so the
-        // keyboard password dialog appears.
-        return Err(PamError::AUTH_ERR);
-    }
-    if trimmed.starts_with("ERROR:") || trimmed.is_empty() {
-        return Err(PamError::AUTH_ERR);
-    }
+        if msg == "CANCEL" {
+            return Err(PamError::ABORT);
+        }
+        if msg.starts_with("ERROR:") || msg.is_empty() {
+            return Err(PamError::AUTH_ERR);
+        }
 
-    Ok(trimmed.to_string())
+        let correct = if let Some(encoded) = msg.strip_prefix("PIN:") {
+            if stored_hash.is_empty() {
+                false  // No PIN configured
+            } else {
+                verify_pin(encoded, stored_hash).unwrap_or(false)
+            }
+        } else if let Some(password) = msg.strip_prefix("KBD:") {
+            verify_password(username, password)
+        } else {
+            return Err(PamError::AUTH_ERR);
+        };
+
+        let reply: &[u8] = if correct { b"CORRECT\n" } else { b"WRONG\n" };
+        stream.write_all(reply).map_err(|_| PamError::AUTH_ERR)?;
+
+        if correct {
+            return Ok(());
+        }
+        // WRONG → daemon sends WrongPassword to overlay; loop for next attempt.
+    }
 }
 
-// ── Hash verification ─────────────────────────────────────────────────────────
+// ── Verification helpers ──────────────────────────────────────────────────────
 
 fn verify_pin(pin: &str, stored_hash: &str) -> anyhow::Result<bool> {
-    let parsed_hash = PasswordHash::new(stored_hash.trim())
-        .map_err(|e| anyhow::anyhow!("stored PIN hash is malformed: {e}"))?;
-    Ok(Argon2::default()
-        .verify_password(pin.as_bytes(), &parsed_hash)
-        .is_ok())
+    let parsed = PasswordHash::new(stored_hash)
+        .map_err(|e| anyhow::anyhow!("malformed PIN hash: {e}"))?;
+    Ok(Argon2::default().verify_password(pin.as_bytes(), &parsed).is_ok())
+}
+
+/// Verify `password` against the system shadow database for `username`.
+///
+/// Uses `getspnam(3)` + `crypt(3)`. Both require root, which is guaranteed
+/// in a PAM `authenticate` call.
+fn verify_password(username: &str, password: &str) -> bool {
+    let uname = match CString::new(username) {
+        Ok(s)  => s,
+        Err(_) => return false,
+    };
+    let pwd = match CString::new(password) {
+        Ok(s)  => s,
+        Err(_) => return false,
+    };
+
+    unsafe {
+        let sp = libc::getspnam(uname.as_ptr());
+        if sp.is_null() {
+            return false;
+        }
+        let hash_ptr = (*sp).sp_pwdp;
+        if hash_ptr.is_null() {
+            return false;
+        }
+        let result = crypt(pwd.as_ptr(), hash_ptr);
+        if result.is_null() {
+            return false;
+        }
+        // crypt(password, stored_hash) == stored_hash  ↔  correct password
+        libc::strcmp(result, hash_ptr) == 0
+    }
 }
 
 pamsm::pam_module!(PamDeckery);

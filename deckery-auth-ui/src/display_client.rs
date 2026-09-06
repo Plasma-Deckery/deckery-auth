@@ -36,6 +36,8 @@ enum Event {
     Confirm(u64),
     /// Session ID — only the owning UI reacts.
     Cancel(u64),
+    /// Verification failed — overlay shows ✗ briefly and stays open for retry.
+    WrongPassword(u64),
     /// Session ID — only the owning UI reacts.
     SessionEnd(u64),
 }
@@ -53,6 +55,8 @@ fn parse_line(line: &str) -> Option<Event> {
         Some(Event::Confirm(id_str.parse().ok()?))
     } else if let Some(id_str) = line.strip_prefix("CANCEL:") {
         Some(Event::Cancel(id_str.parse().ok()?))
+    } else if let Some(id_str) = line.strip_prefix("WRONG_PASSWORD:") {
+        Some(Event::WrongPassword(id_str.parse().ok()?))
     } else if let Some(id_str) = line.strip_prefix("SESSION_END:") {
         Some(Event::SessionEnd(id_str.parse().ok()?))
     } else {
@@ -113,6 +117,11 @@ pub mod ffi {
         #[qsignal]
         fn cancelled(self: Pin<&mut DisplayClient>);
 
+        /// Emitted when the daemon reports a wrong PIN or password.
+        /// The overlay shows ✗ briefly and stays open so the user can retry.
+        #[qsignal]
+        fn wrong_password(self: Pin<&mut DisplayClient>);
+
         #[qsignal]
         fn session_ended(self: Pin<&mut DisplayClient>);
 
@@ -126,10 +135,12 @@ pub mod ffi {
         #[qinvokable]
         fn send_ui_cancel(self: Pin<&mut DisplayClient>);
 
-        /// Switch to keyboard password — cancels controller input and lets
-        /// pam_unix handle the rest (shows system password dialog).
+        /// Send a password typed in the overlay's keyboard-input mode.
+        /// The daemon passes it to pam_deckery as `KBD_AUTH:<pwd>`, which sets
+        /// PAM_AUTHTOK and returns AUTH_ERR so pam_unix (try_first_pass) verifies
+        /// it against the system password without prompting.
         #[qinvokable]
-        fn send_ui_switch_kb(self: Pin<&mut DisplayClient>);
+        fn send_ui_password(self: Pin<&mut DisplayClient>, password: QString);
     }
 }
 
@@ -179,9 +190,12 @@ impl ffi::DisplayClient {
                     => self.as_mut().confirmed(),
                 Event::Cancel(id) if id == self.rust().current_session_id
                     => self.as_mut().cancelled(),
+                Event::WrongPassword(id) if id == self.rust().current_session_id
+                    => self.as_mut().wrong_password(),
                 Event::SessionEnd(id) if id == self.rust().current_session_id
                     => self.as_mut().session_ended(),
-                Event::Confirm(_) | Event::Cancel(_) | Event::SessionEnd(_) => {}
+                Event::Confirm(_) | Event::Cancel(_) | Event::WrongPassword(_)
+                | Event::SessionEnd(_) => {}
             }
         }
     }
@@ -194,11 +208,12 @@ impl ffi::DisplayClient {
         }
     }
 
-    fn send_ui_switch_kb(self: Pin<&mut Self>) {
-        let id    = self.rust().current_session_id;
-        let guard = self.rust().cmd_tx.lock().unwrap();
+    fn send_ui_password(self: Pin<&mut Self>, password: QString) {
+        let id       = self.rust().current_session_id;
+        let pwd_str  = password.to_string();
+        let guard    = self.rust().cmd_tx.lock().unwrap();
         if let Some(tx) = guard.as_ref() {
-            let _ = tx.send(format!("UI_SWITCH_KB:{id}\n"));
+            let _ = tx.send(format!("UI_PASSWORD:{id}:{pwd_str}\n"));
         }
     }
 }

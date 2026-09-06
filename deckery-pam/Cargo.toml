@@ -13,4 +13,5 @@ crate-type = ["cdylib"]
 [dependencies]
 argon2 = { workspace = true }
 anyhow = { workspace = true }
+libc = { workspace = true }
 pamsm = { version = "0.5", features = ["libpam"] }

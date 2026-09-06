@@ -10,12 +10,14 @@ ApplicationWindow {
     id: root
 
     // ── Layer Shell ───────────────────────────────────────────────────────────
-    LayerShell.Window.layer:                 LayerShell.Window.LayerOverlay
+    LayerShell.Window.layer:                 LayerShell.Window.LayerTop
     LayerShell.Window.anchors:               LayerShell.Window.AnchorTop
                                            | LayerShell.Window.AnchorBottom
                                            | LayerShell.Window.AnchorLeft
                                            | LayerShell.Window.AnchorRight
-    LayerShell.Window.keyboardInteractivity: LayerShell.Window.KeyboardInteractivityNone
+    LayerShell.Window.keyboardInteractivity: root.passwordMode
+                                           ? LayerShell.Window.KeyboardInteractivityOnDemand
+                                           : LayerShell.Window.KeyboardInteractivityNone
     LayerShell.Window.exclusionZone:         -1
 
     visible:    false
@@ -23,11 +25,12 @@ ApplicationWindow {
     flags:      Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
 
     // ── State ─────────────────────────────────────────────────────────────────
-    property string authSource:  ""
-    property var    tokens:      []
-    property string statusText:  ""
-    property bool   finishing:   false
-    property bool   showTokens:  true
+    property string authSource:   ""
+    property var    tokens:       []
+    property string statusText:   ""
+    property bool   finishing:    false
+    property bool   showTokens:   true
+    property bool   passwordMode: false   // true = keyboard input overlay
 
     // ── DisplayClient polling ─────────────────────────────────────────────────
     Timer {
@@ -42,12 +45,13 @@ ApplicationWindow {
         onSession_started: (source) => {
             console.log("SESSION_STARTED:", source)
             hideTimer.stop()
-            root.authSource  = source
-            root.tokens      = []
-            root.statusText  = ""
-            root.finishing   = false
-            root.showTokens  = true
-            root.visible     = true
+            root.authSource   = source
+            root.tokens       = []
+            root.statusText   = ""
+            root.finishing    = false
+            root.showTokens   = true
+            root.passwordMode = false
+            root.visible      = true
         }
         onToken_added:      (token) => { root.tokens = root.tokens.concat([token]) }
         onBackspace_pressed: {
@@ -56,11 +60,21 @@ ApplicationWindow {
         }
         onConfirmed:  { root.statusText = "✓"; root.finishing = true }
         onCancelled:  { root.statusText = "✗"; root.finishing = true }
+        onWrong_password: {
+            root.tokens     = []
+            root.statusText = "✗"
+            wrongFlashTimer.restart()
+        }
         onSession_ended: { hideTimer.restart() }
     }
 
     Timer { id: hideTimer; interval: 700; repeat: false
-        onTriggered: { root.visible = false; root.tokens = []; root.finishing = false } }
+        onTriggered: { root.visible = false; root.tokens = []; root.finishing = false; root.passwordMode = false } }
+
+    // Brief ✗ flash on wrong PIN / password — clears after 700 ms without
+    // closing the overlay or setting finishing (user can retry immediately).
+    Timer { id: wrongFlashTimer; interval: 700; repeat: false
+        onTriggered: { if (!root.finishing) root.statusText = "" } }
 
     // ── Full-screen scrim ─────────────────────────────────────────────────────
     Rectangle {
@@ -149,7 +163,7 @@ ApplicationWindow {
                 }
                 MouseArea {
                     id: kbBtn; anchors.fill: parent; hoverEnabled: true
-                    onClicked: client.send_ui_switch_kb()
+                    onClicked: root.passwordMode = true
                 }
             }
         }
@@ -313,6 +327,99 @@ ApplicationWindow {
                     color:               root.statusText === "✓" ? "#a6e3a1" : "#f38ba8"
                     font.pixelSize:      Math.round(48 * deckView.scale)
                     horizontalAlignment: Text.AlignHCenter
+                }
+            }
+        }
+
+        // ── Password input overlay (passwordMode) ─────────────────────────────
+        Rectangle {
+            anchors.centerIn: parent
+            visible:          root.passwordMode && !root.finishing
+            width:            420; height: 160
+            radius:           12
+            color:            "#e61e1e2e"
+            border.color:     "#585b70"; border.width: 1
+
+            Column {
+                anchors.centerIn: parent
+                spacing:          14
+
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text:           "Enter system password"
+                    color:          "#cdd6f4"
+                    font.pixelSize: 15
+                    font.bold:      true
+                }
+
+                // Password field
+                Rectangle {
+                    width:  340; height: 36
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    radius: 6
+                    color:  "#181825"
+                    border.color: pwdField.activeFocus ? "#89b4fa" : "#45475a"
+                    border.width: 1
+
+                    TextInput {
+                        id:             pwdField
+                        anchors.fill:   parent
+                        anchors.margins: 10
+                        echoMode:       TextInput.Password
+                        color:          "#cdd6f4"
+                        font.pixelSize: 15
+                        font.family:    "monospace"
+                        focus:          root.passwordMode && !root.finishing
+
+                        Keys.onReturnPressed: {
+                            if (text.length > 0) {
+                                client.send_ui_password(text)
+                                text = ""
+                            }
+                        }
+                        Keys.onEscapePressed: {
+                            client.send_ui_cancel()
+                        }
+                    }
+                }
+
+                // Buttons row
+                Row {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 12
+
+                    // Cancel
+                    Rectangle {
+                        width: 100; height: 32; radius: 6
+                        color:        cancelBtn.containsMouse ? "#40f38ba8" : "#201e1e2e"
+                        border.color: "#f38ba8"; border.width: 1
+                        Text { anchors.centerIn: parent; text: "Cancel"
+                               color: "#f38ba8"; font.pixelSize: 13 }
+                        MouseArea {
+                            id: cancelBtn; anchors.fill: parent; hoverEnabled: true
+                            onClicked: client.send_ui_cancel()
+                        }
+                    }
+
+                    // Confirm
+                    Rectangle {
+                        width: 100; height: 32; radius: 6
+                        color:        confirmBtn.containsMouse ? "#4089b4fa" : "#201e1e2e"
+                        border.color: pwdField.text.length > 0 ? "#89b4fa" : "#45475a"
+                        border.width: 1
+                        Text { anchors.centerIn: parent; text: "Confirm"
+                               color: pwdField.text.length > 0 ? "#89b4fa" : "#585b70"
+                               font.pixelSize: 13 }
+                        MouseArea {
+                            id: confirmBtn; anchors.fill: parent; hoverEnabled: true
+                            onClicked: {
+                                if (pwdField.text.length > 0) {
+                                    client.send_ui_password(pwdField.text)
+                                    pwdField.text = ""
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

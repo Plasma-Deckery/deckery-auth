@@ -11,32 +11,42 @@
 //!  pam_deckery.so (root, within PAM stack)
 //!       │  connect /run/deckery/auth.sock   (mode 0600 — root only)
 //!       │  send "<source>\n"
-//!       │  blocking read until response
+//!       │  multi-turn: recv PIN:/KBD: → send CORRECT/WRONG
 //!       ▼
 //!  deckery-auth-daemon (root, systemd service)
 //!       │  priority queue, serves highest-priority first
 //!       │  TokenReader → exclusive evdev grab + Lizard Mode
 //!       │  reads tokens until Confirm / Cancel / IO error
+//!       │  per-attempt: sends attempt to pam_deckery, awaits CORRECT/WRONG
+//!       │  on WRONG: sends WrongPassword display event, retries
 //!       │
 //!       │  display.sock (mode 0666, but exe-verified)
 //!       │    on connect: SO_PEERCRED → PID → /proc/<pid>/exe
 //!       │    only DISPLAY_EXE_ALLOWLIST binaries are accepted
 //!       │    accepted clients receive event stream (bidirectional)
-//!       │    UI_CANCEL:<id> → cancel active session if IDs match
+//!       │    UI_CANCEL:<id>          → cancel active session if IDs match
+//!       │    UI_PASSWORD:<id>:<pwd>  → keyboard password attempt
 //!       ▼
-//!  pam_deckery receives encoded PIN (or CANCEL / ERROR:…)
+//!  pam_deckery receives CORRECT (returns SUCCESS) or CANCEL (returns ABORT)
 //! ```
 //!
-//! # Auth socket protocol (auth.sock)
+//! # Auth socket protocol (auth.sock) — multi-turn
 //!
 //! **Client → daemon:** `<source>\n`  e.g. `sudo`, `screenlock`
 //!
-//! **Daemon → client:**
-//! | Response | Meaning |
+//! **Daemon → client (one message per attempt):**
+//! | Message | Meaning |
 //! |---|---|
-//! | `<encoded_pin>\n` | Confirm pressed |
-//! | `CANCEL\n` | Cancel pressed |
+//! | `PIN:<encoded>\n` | Encoded controller PIN sequence |
+//! | `KBD:<password>\n` | Keyboard password typed in overlay |
+//! | `CANCEL\n` | User cancelled — pam_deckery returns PAM_ABORT |
 //! | `ERROR:<msg>\n` | Controller unavailable or IO error |
+//!
+//! **Client → daemon (per attempt):**
+//! | Message | Meaning |
+//! |---|---|
+//! | `CORRECT\n` | Verification succeeded |
+//! | `WRONG\n` | Verification failed — daemon shows ✗ and waits for retry |
 //!
 //! # Display socket protocol (display.sock)
 //!
@@ -47,12 +57,14 @@
 //! BACKSPACE\n
 //! CONFIRM:<session_id>\n
 //! CANCEL:<session_id>\n
+//! WRONG_PASSWORD:<session_id>\n
 //! SESSION_END:<session_id>\n
 //! ```
 //!
 //! **UI → Daemon (command lines):**
 //! ```text
 //! UI_CANCEL:<session_id>\n
+//! UI_PASSWORD:<session_id>:<password>\n
 //! ```
 //!
 //! # Display peer verification
@@ -62,10 +74,6 @@
 //! incoming connection and resolves `/proc/<pid>/exe` to verify the binary.
 //! Only paths listed in `DISPLAY_EXE_ALLOWLIST` are accepted; all others are
 //! closed without receiving any data.
-//!
-//! This provides process-level isolation: not just UID-level but binary-level.
-//! Root can read any process's `/proc/<pid>/exe`; the symlink is set by the
-//! kernel and cannot be faked by the connecting process.
 //!
 //! # Priority queue
 //!
@@ -87,7 +95,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, oneshot, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use deckery_input::{ControlAction, Token, TokenReader, encode_sequence};
 
@@ -98,10 +106,30 @@ const AUTH_SOCKET_PATH: &str = "/run/deckery/auth.sock";
 const DISPLAY_SOCKET_PATH: &str = "/run/deckery/display.sock";
 
 /// Only these binaries may receive display events.
-/// Checked via SO_PEERCRED → /proc/<pid>/exe (resolved by root, not faked by peer).
 const DISPLAY_EXE_ALLOWLIST: &[&str] = &[
     "/usr/local/bin/deckery-auth-ui",
 ];
+
+// ── Attempt / verify channel types ───────────────────────────────────────────
+
+/// Worker → handle_incoming: "here is something to verify."
+enum AttemptMsg {
+    /// Encoded controller PIN sequence. Client verifies argon2.
+    Pin(String),
+    /// Keyboard password typed in overlay. Client verifies shadow/crypt.
+    Password(String),
+    /// User cancelled — send CANCEL to client and close.
+    Cancel,
+    /// Error (e.g. controller unavailable) — send ERROR to client and close.
+    Error(String),
+}
+
+/// handle_incoming → worker: "the client said..."
+#[derive(Debug, Clone, Copy)]
+enum VerifyMsg {
+    Correct,
+    Wrong,
+}
 
 // ── Display events ────────────────────────────────────────────────────────────
 
@@ -112,6 +140,8 @@ enum DisplayEvent {
     Backspace,
     Confirm(u64),
     Cancel(u64),
+    /// Verification failed — overlay shows ✗ briefly and stays open for retry.
+    WrongPassword(u64),
     SessionEnd(u64),
 }
 
@@ -123,6 +153,7 @@ impl DisplayEvent {
             DisplayEvent::Backspace             => "BACKSPACE\n".to_string(),
             DisplayEvent::Confirm(id)           => format!("CONFIRM:{id}\n"),
             DisplayEvent::Cancel(id)            => format!("CANCEL:{id}\n"),
+            DisplayEvent::WrongPassword(id)     => format!("WRONG_PASSWORD:{id}\n"),
             DisplayEvent::SessionEnd(id)        => format!("SESSION_END:{id}\n"),
         }
     }
@@ -130,13 +161,6 @@ impl DisplayEvent {
 
 // ── Display peer verification ─────────────────────────────────────────────────
 
-/// Returns `true` iff the peer of `stream` is running a binary in
-/// [`DISPLAY_EXE_ALLOWLIST`].
-///
-/// Reads `SO_PEERCRED` to obtain the peer PID (kernel-set, unforgeable), then
-/// resolves `/proc/<pid>/exe` as root. A `(deleted)` suffix is stripped — it
-/// appears when the binary is updated on disk while the process is still running,
-/// which is a normal occurrence during `deploy.sh`.
 fn verify_display_peer(stream: &tokio::net::UnixStream) -> bool {
     let fd = stream.as_raw_fd();
 
@@ -166,18 +190,10 @@ fn verify_display_peer(stream: &tokio::net::UnixStream) -> bool {
         }
         Ok(path) => {
             let path_str = path.to_string_lossy();
-            // Strip kernel-appended " (deleted)" — appears when the binary is
-            // updated on disk (e.g. during deploy) while the process still runs.
             let exe = path_str.trim_end_matches(" (deleted)");
 
-            // /proc/<pid>/exe is always the *canonical* (symlink-resolved) path.
-            // Allowlist entries may contain symlinks (e.g. /usr/local → /var/usrlocal
-            // on Bazzite/Fedora Atomic). Canonicalise each allowlist entry before
-            // comparing so both sides are symlink-free real paths.
             let allowed = DISPLAY_EXE_ALLOWLIST.iter().any(|&entry| {
-                if exe == entry {
-                    return true; // fast path: already matches verbatim
-                }
+                if exe == entry { return true; }
                 std::fs::canonicalize(entry)
                     .map(|c| c.to_string_lossy() == exe)
                     .unwrap_or(false)
@@ -210,10 +226,15 @@ fn priority_for_source(source: &str) -> u8 {
 // ── Queue ─────────────────────────────────────────────────────────────────────
 
 struct QueueEntry {
-    priority: u8,
-    sequence: u64,
-    source:   String,
-    response: oneshot::Sender<Response>,
+    priority:   u8,
+    sequence:   u64,
+    source:     String,
+    /// Worker sends attempts (PIN/Password/Cancel/Error) through this channel.
+    /// `handle_incoming` reads from the paired receiver and writes to the socket.
+    attempt_tx: mpsc::UnboundedSender<AttemptMsg>,
+    /// `handle_incoming` sends verify results (Correct/Wrong) through this channel.
+    /// Worker reads from the paired receiver to decide whether to retry or finish.
+    verify_rx:  mpsc::UnboundedReceiver<VerifyMsg>,
 }
 
 impl Ord for QueueEntry {
@@ -234,31 +255,22 @@ struct Queue {
 impl Queue {
     fn new() -> Self { Self { heap: BinaryHeap::new(), sequence: 0 } }
 
-    fn push(&mut self, source: String, response: oneshot::Sender<Response>) {
+    /// Push a new entry. Returns the (attempt_tx, verify_rx) pair for the worker.
+    /// The caller (`handle_incoming`) keeps (attempt_rx, verify_tx).
+    fn push(
+        &mut self,
+        source:     String,
+        attempt_tx: mpsc::UnboundedSender<AttemptMsg>,
+        verify_rx:  mpsc::UnboundedReceiver<VerifyMsg>,
+    ) {
         let priority = priority_for_source(&source);
         let sequence = self.sequence;
         self.sequence += 1;
-        self.heap.push(QueueEntry { priority, sequence, source, response });
+        self.heap.push(QueueEntry { priority, sequence, source, attempt_tx, verify_rx });
     }
 
     fn pop(&mut self) -> Option<QueueEntry> { self.heap.pop() }
     fn len(&self) -> usize { self.heap.len() }
-}
-
-enum Response {
-    Pin(String),
-    /// Hard cancel — pam_deckery returns PAM_ABORT, no keyboard fallback.
-    Cancel,
-    /// Soft cancel — pam_deckery returns AUTH_ERR, falls through to pam_unix.
-    SwitchKeyboard,
-    Error(String),
-}
-
-/// Outcome of a PIN collection session.
-enum PinOutcome {
-    Pin(String),
-    Cancel,
-    SwitchKeyboard,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -282,16 +294,20 @@ async fn main() -> Result<()> {
     let queue  = Arc::new(Mutex::new(Queue::new()));
     let notify = Arc::new(Notify::new());
 
-    let (display_tx, _)    = broadcast::channel::<DisplayEvent>(64);
-    let (ui_cancel_tx, _)  = broadcast::channel::<u64>(4);
-    let (ui_switch_kb_tx, _) = broadcast::channel::<u64>(4);
+    let (display_tx, _)     = broadcast::channel::<DisplayEvent>(64);
+    let (ui_cancel_tx, _)   = broadcast::channel::<u64>(4);
+    let (ui_password_tx, _) = broadcast::channel::<(u64, String)>(4);
 
-    // Tracks the currently active session so a reconnecting UI client can be
-    // sent SESSION_START immediately without waiting for the next event.
     let active_session: Arc<Mutex<Option<(String, u64)>>> = Arc::new(Mutex::new(None));
 
-    tokio::spawn(worker_loop(queue.clone(), notify.clone(), display_tx.clone(), ui_cancel_tx.clone(), ui_switch_kb_tx.clone(), active_session.clone()));
-    tokio::spawn(display_accept_loop(display_tx, ui_cancel_tx, ui_switch_kb_tx, active_session));
+    tokio::spawn(worker_loop(
+        queue.clone(), notify.clone(),
+        display_tx.clone(), ui_cancel_tx.clone(), ui_password_tx.clone(),
+        active_session.clone(),
+    ));
+    tokio::spawn(display_accept_loop(
+        display_tx, ui_cancel_tx, ui_password_tx, active_session,
+    ));
     auth_accept_loop(listener, queue, notify).await;
 
     Ok(())
@@ -302,7 +318,7 @@ async fn main() -> Result<()> {
 async fn display_accept_loop(
     display_tx:      broadcast::Sender<DisplayEvent>,
     ui_cancel_tx:    broadcast::Sender<u64>,
-    ui_switch_kb_tx: broadcast::Sender<u64>,
+    ui_password_tx:  broadcast::Sender<(u64, String)>,
     active_session:  Arc<Mutex<Option<(String, u64)>>>,
 ) {
     let _ = tokio::fs::remove_file(DISPLAY_SOCKET_PATH).await;
@@ -313,8 +329,6 @@ async fn display_accept_loop(
             return;
         }
     };
-    // 0666: the user-space UI needs to connect.
-    // Actual access control is done by verify_display_peer().
     let _ = std::fs::set_permissions(
         DISPLAY_SOCKET_PATH,
         std::fs::Permissions::from_mode(0o666),
@@ -325,40 +339,31 @@ async fn display_accept_loop(
         match listener.accept().await {
             Err(e) => eprintln!("deckery-auth-daemon: display accept error: {e}"),
             Ok((stream, _)) => {
-                // Verify binary identity before handing off.
-                if !verify_display_peer(&stream) {
-                    // Connection is dropped here; peer receives EOF.
-                    continue;
-                }
-                let rx = display_tx.subscribe();
-                // Snapshot active session *before* subscribing so we can
-                // replay SESSION_START if a session is already running.
+                if !verify_display_peer(&stream) { continue; }
+                let rx     = display_tx.subscribe();
                 let replay = { active_session.lock().await.clone() };
-                tokio::spawn(handle_display_connection(stream, rx, ui_cancel_tx.clone(), ui_switch_kb_tx.clone(), replay));
+                tokio::spawn(handle_display_connection(
+                    stream, rx, ui_cancel_tx.clone(), ui_password_tx.clone(), replay,
+                ));
             }
         }
     }
 }
 
-/// Forwards display events to a verified frontend and reads back UI_CANCEL commands.
 async fn handle_display_connection(
-    stream:          UnixStream,
-    mut rx:          broadcast::Receiver<DisplayEvent>,
-    ui_cancel_tx:    broadcast::Sender<u64>,
-    ui_switch_kb_tx: broadcast::Sender<u64>,
-    replay:          Option<(String, u64)>,
+    stream:         UnixStream,
+    mut rx:         broadcast::Receiver<DisplayEvent>,
+    ui_cancel_tx:   broadcast::Sender<u64>,
+    ui_password_tx: broadcast::Sender<(u64, String)>,
+    replay:         Option<(String, u64)>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut incoming = BufReader::new(read_half).lines();
 
-    // If a session was already active when this client connected, replay
-    // SESSION_START so the overlay opens immediately.
     if let Some((source, id)) = replay {
         eprintln!("deckery-auth-daemon: replaying SESSION_START:{source}:{id} to reconnected display client");
         let line = DisplayEvent::SessionStart(source, id).to_line();
-        if write_half.write_all(line.as_bytes()).await.is_err() {
-            return;
-        }
+        if write_half.write_all(line.as_bytes()).await.is_err() { return; }
     }
 
     loop {
@@ -385,11 +390,13 @@ async fn handle_display_connection(
                             let _ = ui_cancel_tx.send(id);
                         }
                     }
-                    Ok(Some(l)) if l.trim().starts_with("UI_SWITCH_KB:") => {
-                        let id_str = l.trim().strip_prefix("UI_SWITCH_KB:").unwrap_or("");
-                        if let Ok(id) = id_str.parse::<u64>() {
-                            eprintln!("deckery-auth-daemon: UI switch-to-keyboard (session {id})");
-                            let _ = ui_switch_kb_tx.send(id);
+                    Ok(Some(l)) if l.trim().starts_with("UI_PASSWORD:") => {
+                        let rest = l.trim().strip_prefix("UI_PASSWORD:").unwrap_or("");
+                        if let Some((id_str, password)) = rest.split_once(':') {
+                            if let Ok(id) = id_str.parse::<u64>() {
+                                eprintln!("deckery-auth-daemon: UI keyboard password (session {id})");
+                                let _ = ui_password_tx.send((id, password.to_owned()));
+                            }
                         }
                     }
                     Ok(Some(_)) => {}
@@ -415,55 +422,130 @@ async fn auth_accept_loop(
     }
 }
 
+/// Handles one pam_deckery connection.
+///
+/// Reads the source name, registers with the queue, then mediates the
+/// multi-turn protocol between the socket (pam_deckery) and the worker
+/// (`collect_pin`):
+///
+/// ```text
+/// worker ──AttemptMsg──► handle_incoming ──PIN:/KBD:/CANCEL/ERROR──► pam_deckery
+/// worker ◄──VerifyMsg─── handle_incoming ◄──────CORRECT/WRONG──────── pam_deckery
+/// ```
 async fn handle_incoming(mut stream: UnixStream, queue: Arc<Mutex<Queue>>, notify: Arc<Notify>) {
+    // Read source name.
     let source = {
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
         match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => { let _ = stream.write_all(b"ERROR:read source\n").await; return; }
-            Ok(_)          => line.trim().to_string(),
+            Ok(0) | Err(_) => {
+                let _ = stream.write_all(b"ERROR:read source\n").await;
+                return;
+            }
+            Ok(_) => line.trim().to_string(),
         }
     };
 
     let priority = priority_for_source(&source);
-    let (response_tx, response_rx) = oneshot::channel::<Response>();
-    let queue_len = { let mut q = queue.lock().await; q.push(source.clone(), response_tx); q.len() };
+
+    // Create the two channels that connect this handler with the worker.
+    // handle_incoming keeps:  attempt_rx (reads attempts) + verify_tx (sends results)
+    // QueueEntry keeps:       attempt_tx (sends attempts) + verify_rx (reads results)
+    let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel::<AttemptMsg>();
+    let (verify_tx,      verify_rx ) = mpsc::unbounded_channel::<VerifyMsg>();
+
+    let queue_len = {
+        let mut q = queue.lock().await;
+        q.push(source.clone(), attempt_tx, verify_rx);
+        q.len()
+    };
     notify.notify_one();
 
     eprintln!("deckery-auth-daemon: queued '{source}' (priority {priority}) — {queue_len} request(s)");
 
-    let response = match response_rx.await {
-        Ok(r)  => r,
-        Err(_) => Response::Error("worker crashed".into()),
-    };
+    // Split into owned halves so we can write and read concurrently without
+    // borrow conflicts.
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
-    match response {
-        Response::Pin(p)        => { let _ = stream.write_all(format!("{p}\n").as_bytes()).await; }
-        Response::Cancel        => { let _ = stream.write_all(b"CANCEL\n").await; }
-        Response::SwitchKeyboard => { let _ = stream.write_all(b"SWITCH_KB\n").await; }
-        Response::Error(e)      => { let _ = stream.write_all(format!("ERROR:{e}\n").as_bytes()).await; }
+    let mut idle_buf = String::new();
+    loop {
+        // Wait for the next attempt from collect_pin, OR detect that pam_deckery
+        // closed the connection (EOF/error on the read half while we're idle).
+        // In the idle state pam_deckery sends nothing, so any read result means
+        // the peer disconnected — drop channels so collect_pin can clean up.
+        let msg = tokio::select! {
+            msg = attempt_rx.recv() => match msg {
+                None      => break,   // collect_pin dropped sender — session over
+                Some(msg) => msg,
+            },
+            result = reader.read_line(&mut idle_buf) => {
+                // Ok(0) = EOF (pam_deckery died/timed out), Err = broken pipe.
+                // Either way: peer is gone. Dropping verify_tx here will cause
+                // collect_pin's verify_rx.recv() to return None → clean exit.
+                let _ = result;
+                eprintln!("deckery-auth-daemon: pam_deckery disconnected mid-session — cleaning up");
+                break;
+            }
+        };
+
+        match msg {
+            AttemptMsg::Cancel => {
+                let _ = write_half.write_all(b"CANCEL\n").await;
+                break;
+            }
+            AttemptMsg::Error(e) => {
+                let _ = write_half.write_all(format!("ERROR:{e}\n").as_bytes()).await;
+                break;
+            }
+            AttemptMsg::Pin(encoded) => {
+                if write_half.write_all(format!("PIN:{encoded}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            AttemptMsg::Password(pwd) => {
+                if write_half.write_all(format!("KBD:{pwd}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        // Read CORRECT or WRONG from pam_deckery.
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let response = line.trim_end_matches(['\n', '\r']);
+        let result = if response == "CORRECT" { VerifyMsg::Correct } else { VerifyMsg::Wrong };
+        let _ = verify_tx.send(result);
+
+        if matches!(result, VerifyMsg::Correct) {
+            break;  // Done — worker will send Confirm+SessionEnd display events.
+        }
+        // Wrong → loop: wait for worker to send next AttemptMsg.
     }
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
 async fn worker_loop(
-    queue:           Arc<Mutex<Queue>>,
-    notify:          Arc<Notify>,
-    display_tx:      broadcast::Sender<DisplayEvent>,
-    ui_cancel_tx:    broadcast::Sender<u64>,
-    ui_switch_kb_tx: broadcast::Sender<u64>,
-    active_session:  Arc<Mutex<Option<(String, u64)>>>,
+    queue:          Arc<Mutex<Queue>>,
+    notify:         Arc<Notify>,
+    display_tx:     broadcast::Sender<DisplayEvent>,
+    ui_cancel_tx:   broadcast::Sender<u64>,
+    ui_password_tx: broadcast::Sender<(u64, String)>,
+    active_session: Arc<Mutex<Option<(String, u64)>>>,
 ) {
     let mut next_session_id: u64 = 0;
-    eprintln!("deckery-auth-daemon: worker_loop started");
     loop {
-        let (entry, qlen) = { let mut q = queue.lock().await; let e = q.pop(); let l = q.len(); (e, l) };
-        eprintln!("deckery-auth-daemon: worker_loop tick: entry={} remaining={}", entry.is_some(), qlen);
+        let entry = { let mut q = queue.lock().await; q.pop() };
         match entry {
-            None => { eprintln!("deckery-auth-daemon: worker_loop: waiting for notify"); notify.notified().await; }
+            None => { notify.notified().await; }
             Some(entry) => {
-                if entry.response.is_closed() {
+                // Detect abandoned connections (pam_deckery disconnected before
+                // being served). attempt_tx is closed when handle_incoming exits.
+                if entry.attempt_tx.is_closed() {
                     eprintln!("deckery-auth-daemon: '{}' abandoned (client disconnected)", entry.source);
                     continue;
                 }
@@ -471,14 +553,18 @@ async fn worker_loop(
                 let session_id = next_session_id;
                 next_session_id += 1;
                 *active_session.lock().await = Some((entry.source.clone(), session_id));
-                let response = match collect_pin(&entry.source, &display_tx, &ui_cancel_tx, &ui_switch_kb_tx, session_id).await {
-                    Ok(PinOutcome::Pin(pin))    => Response::Pin(pin),
-                    Ok(PinOutcome::Cancel)      => Response::Cancel,
-                    Ok(PinOutcome::SwitchKeyboard) => Response::SwitchKeyboard,
-                    Err(e) => { eprintln!("deckery-auth-daemon: collect_pin error (session {session_id}): {e:#}"); let _ = display_tx.send(DisplayEvent::SessionEnd(session_id)); Response::Error(e.to_string()) }
-                };
+
+                collect_pin(
+                    entry.attempt_tx,
+                    entry.verify_rx,
+                    &entry.source,
+                    &display_tx,
+                    &ui_cancel_tx,
+                    &ui_password_tx,
+                    session_id,
+                ).await;
+
                 *active_session.lock().await = None;
-                let _ = entry.response.send(response);
             }
         }
     }
@@ -487,65 +573,125 @@ async fn worker_loop(
 // ── PIN collection ────────────────────────────────────────────────────────────
 
 async fn collect_pin(
-    source:          &str,
-    display_tx:      &broadcast::Sender<DisplayEvent>,
-    ui_cancel_tx:    &broadcast::Sender<u64>,
-    ui_switch_kb_tx: &broadcast::Sender<u64>,
-    session_id:      u64,
-) -> Result<PinOutcome> {
-    let mut ui_cancel_rx    = ui_cancel_tx.subscribe();
-    let mut ui_switch_kb_rx = ui_switch_kb_tx.subscribe();
-    let mut reader = TokenReader::open().await.context("open controller")?;
+    attempt_tx:     mpsc::UnboundedSender<AttemptMsg>,
+    mut verify_rx:  mpsc::UnboundedReceiver<VerifyMsg>,
+    source:         &str,
+    display_tx:     &broadcast::Sender<DisplayEvent>,
+    ui_cancel_tx:   &broadcast::Sender<u64>,
+    ui_password_tx: &broadcast::Sender<(u64, String)>,
+    session_id:     u64,
+) {
+    let mut reader = match TokenReader::open().await {
+        Ok(r)  => r,
+        Err(e) => {
+            eprintln!("deckery-auth-daemon: cannot open controller (session {session_id}): {e:#}");
+            let _ = attempt_tx.send(AttemptMsg::Error(e.to_string()));
+            let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+            return;
+        }
+    };
 
-    eprintln!("deckery-auth-daemon: PIN collection on {}", reader.path().display());
+    eprintln!("deckery-auth-daemon: PIN collection on {} (session {session_id})", reader.path().display());
     let _ = display_tx.send(DisplayEvent::SessionStart(source.to_string(), session_id));
+
+    let mut ui_cancel_rx   = ui_cancel_tx.subscribe();
+    let mut ui_password_rx = ui_password_tx.subscribe();
     let mut tokens: Vec<Token> = Vec::new();
 
     loop {
         tokio::select! {
             token_result = reader.next_token() => {
-                let token = token_result.context("read controller event")?;
+                let token = match token_result {
+                    Ok(t)  => t,
+                    Err(e) => {
+                        eprintln!("deckery-auth-daemon: controller error (session {session_id}): {e:#}");
+                        let _ = attempt_tx.send(AttemptMsg::Error(e.to_string()));
+                        let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+                        return;
+                    }
+                };
                 match token {
                     Token::Control(ControlAction::Confirm) => {
-                        eprintln!("deckery-auth-daemon: Confirm — {} token(s)", tokens.len());
-                        let _ = display_tx.send(DisplayEvent::Confirm(session_id));
-                        let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                        return Ok(PinOutcome::Pin(encode_sequence(&tokens)));
+                        let encoded = encode_sequence(&tokens);
+                        eprintln!("deckery-auth-daemon: Confirm — sending PIN (session {session_id})");
+                        if attempt_tx.send(AttemptMsg::Pin(encoded)).is_err() { return; }
+
+                        match verify_rx.recv().await {
+                            None => {
+                                // handle_incoming dropped verify_tx — pam_deckery gone.
+                                eprintln!("deckery-auth-daemon: pam_deckery gone after PIN (session {session_id})");
+                                let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+                                return;
+                            }
+                            Some(VerifyMsg::Correct) => {
+                                eprintln!("deckery-auth-daemon: PIN correct (session {session_id})");
+                                let _ = display_tx.send(DisplayEvent::Confirm(session_id));
+                                let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+                                return;
+                            }
+                            Some(VerifyMsg::Wrong) => {
+                                eprintln!("deckery-auth-daemon: PIN wrong (session {session_id})");
+                                tokens.clear();
+                                let _ = display_tx.send(DisplayEvent::WrongPassword(session_id));
+                                // Continue — user can retry.
+                            }
+                        }
                     }
                     Token::Control(ControlAction::Backspace) => {
                         tokens.pop();
-                        eprintln!("deckery-auth-daemon: Backspace — {} remaining", tokens.len());
+                        eprintln!("deckery-auth-daemon: Backspace (session {session_id})");
                         let _ = display_tx.send(DisplayEvent::Backspace);
                     }
                     Token::Control(ControlAction::Cancel) => {
-                        eprintln!("deckery-auth-daemon: Cancel (controller)");
+                        eprintln!("deckery-auth-daemon: Cancel (controller, session {session_id})");
+                        let _ = attempt_tx.send(AttemptMsg::Cancel);
                         let _ = display_tx.send(DisplayEvent::Cancel(session_id));
                         let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                        return Ok(PinOutcome::Cancel);
+                        return;
                     }
                     Token::Release(_) => {}
                     t @ Token::Chord(_) => {
                         let encoded = t.encode();
                         let _ = display_tx.send(DisplayEvent::Token(encoded));
                         tokens.push(t);
-                        eprintln!("deckery-auth-daemon: chord — {} total", tokens.len());
                     }
                 }
             }
+
             Ok(id) = ui_cancel_rx.recv() => {
                 if id == session_id {
                     eprintln!("deckery-auth-daemon: Cancel (UI, session {session_id})");
+                    let _ = attempt_tx.send(AttemptMsg::Cancel);
                     let _ = display_tx.send(DisplayEvent::Cancel(session_id));
                     let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                    return Ok(PinOutcome::Cancel);
+                    return;
                 }
             }
-            Ok(id) = ui_switch_kb_rx.recv() => {
+
+            Ok((id, pwd)) = ui_password_rx.recv() => {
                 if id == session_id {
-                    eprintln!("deckery-auth-daemon: Switch-to-keyboard (UI, session {session_id})");
-                    let _ = display_tx.send(DisplayEvent::Cancel(session_id));
-                    let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
-                    return Ok(PinOutcome::SwitchKeyboard);
+                    eprintln!("deckery-auth-daemon: keyboard password (session {session_id})");
+                    if attempt_tx.send(AttemptMsg::Password(pwd)).is_err() { return; }
+
+                    match verify_rx.recv().await {
+                        None => {
+                            eprintln!("deckery-auth-daemon: pam_deckery gone after password (session {session_id})");
+                            let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+                            return;
+                        }
+                        Some(VerifyMsg::Correct) => {
+                            eprintln!("deckery-auth-daemon: password correct (session {session_id})");
+                            let _ = display_tx.send(DisplayEvent::Confirm(session_id));
+                            let _ = display_tx.send(DisplayEvent::SessionEnd(session_id));
+                            return;
+                        }
+                        Some(VerifyMsg::Wrong) => {
+                            eprintln!("deckery-auth-daemon: password wrong (session {session_id})");
+                            tokens.clear();
+                            let _ = display_tx.send(DisplayEvent::WrongPassword(session_id));
+                            // Continue — user can retry (password field was cleared by QML on submit).
+                        }
+                    }
                 }
             }
         }
