@@ -99,6 +99,69 @@ use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use deckery_input::{ControlAction, Token, TokenReader, encode_sequence};
 
+// ── Makima pause / resume ─────────────────────────────────────────────────────
+
+/// RAII guard that sends `pause` to Makima's IPC socket on creation and
+/// `resume` in `Drop` — ensuring Makima is always resumed even if the session
+/// exits early or panics.
+///
+/// If Makima is not running (socket absent or refused), creation is a no-op.
+/// The auth session proceeds regardless.
+struct MakimaPause;
+
+impl MakimaPause {
+    fn pause() -> Self {
+        ipc_send("pause");
+        Self
+    }
+}
+
+impl Drop for MakimaPause {
+    fn drop(&mut self) {
+        ipc_send("resume");
+    }
+}
+
+/// Find all Makima IPC sockets across all logged-in users.
+///
+/// Makima binds in `$XDG_RUNTIME_DIR` (= `/run/user/<uid>/makima-control.sock`).
+/// On a multi-user system there may be more than one; we collect all of them so
+/// every running Makima instance is paused / resumed.  Returns an empty Vec if
+/// no socket is found (Makima not running) — callers treat that as a no-op.
+fn find_makima_sockets() -> Vec<std::path::PathBuf> {
+    let Ok(read_dir) = std::fs::read_dir("/run/user") else { return vec![] };
+    let mut sockets = Vec::new();
+    for entry in read_dir {
+        let Ok(entry) = entry else { continue };
+        let candidate = entry.path().join("makima-control.sock");
+        if candidate.exists() {
+            sockets.push(candidate);
+        }
+    }
+    sockets
+}
+
+/// Send a single-line command to every running Makima instance. Silently
+/// ignores a missing socket (Makima not running is not fatal for the daemon).
+fn ipc_send(cmd: &str) {
+    use std::io::Write;
+    for path in find_makima_sockets() {
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(mut s) => {
+                if let Err(e) = writeln!(s, "{cmd}") {
+                    eprintln!("deckery-auth-daemon: makima IPC write ({path:?}): {e}");
+                } else {
+                    eprintln!("deckery-auth-daemon: makima IPC → {cmd}");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                // Stale socket — Makima exited without cleanup. Skip silently.
+            }
+            Err(e) => eprintln!("deckery-auth-daemon: makima IPC connect ({path:?}): {e}"),
+        }
+    }
+}
+
 /// Root-only socket. PAM module connects here.
 const AUTH_SOCKET_PATH: &str = "/run/deckery/auth.sock";
 
@@ -554,6 +617,11 @@ async fn worker_loop(
                 next_session_id += 1;
                 *active_session.lock().await = Some((entry.source.clone(), session_id));
 
+                // Pause Makima for the duration of the session so it doesn't
+                // process the same controller input we're consuming.
+                // The guard sends SIGCONT automatically when dropped.
+                let _makima_pause = MakimaPause::pause();
+
                 collect_pin(
                     entry.attempt_tx,
                     entry.verify_rx,
@@ -564,6 +632,7 @@ async fn worker_loop(
                     session_id,
                 ).await;
 
+                drop(_makima_pause); // resume Makima before clearing active session
                 *active_session.lock().await = None;
             }
         }
