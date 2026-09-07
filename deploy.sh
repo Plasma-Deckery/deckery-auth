@@ -214,7 +214,8 @@ if [[ "$INSTALL_PHASE" != "1" ]]; then
     echo "==> Building PAM / daemon / pin-set (distrobox: $DISTROBOX)"
     distrobox enter "$DISTROBOX" -- \
         cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" \
-        -p deckery-pam -p deckery-pam-test -p deckery-auth-daemon -p deckery-pin-set
+        -p deckery-pam -p deckery-pam-test -p deckery-auth-daemon -p deckery-pin-set \
+        -p deckery-input --bin deckery-input-test
 
     echo ""
     echo "==> Building UI (distrobox: $DISTROBOX_UI)"
