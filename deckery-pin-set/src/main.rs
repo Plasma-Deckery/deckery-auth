@@ -29,57 +29,25 @@ fn main() -> Result<()> {
         bail!("deckery-pin-set must be run as root (use sudo)");
     }
 
-    // --controller: delegate PIN collection to the daemon (uses the physical
-    // controller instead of the keyboard).  The daemon verifies SO_PEERCRED
-    // independently — this check is just an early-exit with a clear message.
-    if std::env::args().any(|a| a == "--controller") {
-        return controller_mode();
+    // --stdin: non-interactive mode for automated testing (deploy.sh smoke test).
+    // Reads the raw PIN from stdin — no TTY, no daemon, no UI required.
+    // Do not use in production; the PIN is visible to anyone who can inspect
+    // the process's stdin (e.g. via /proc), which is acceptable only because
+    // the caller already has root.
+    if std::env::args().any(|a| a == "--stdin") {
+        return stdin_mode();
     }
 
-    let stdin_mode = std::env::args().any(|a| a == "--stdin");
-
-    let pin = if stdin_mode {
-        // Non-interactive mode for automated testing via deploy.sh.
-        // Reads a single line from stdin — no TTY required.
-        // Do not use in production; the PIN is visible to anyone who can
-        // inspect the process's stdin (e.g. via /proc), which is acceptable
-        // only because the caller already has root.
-        let mut line = String::new();
-        io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .context("failed to read PIN from stdin")?;
-        line.trim_end_matches('\n').trim_end_matches('\r').to_owned()
-    } else {
-        println!("Deckery — controller PIN setup");
-        println!("This PIN is used to authenticate sudo, polkit, and the lock screen");
-        println!("via pam_deckery. It is independent of your login password.\n");
-
-        let pin =
-            rpassword::prompt_password("Enter new PIN: ").context("failed to read PIN")?;
-        let confirm =
-            rpassword::prompt_password("Confirm PIN: ").context("failed to read PIN")?;
-
-        if pin != confirm {
-            bail!("PINs did not match — aborting");
-        }
-        pin
-    };
-
-    if pin.trim().is_empty() {
-        bail!("PIN must not be empty");
-    }
-    if pin.len() < 4 {
-        bail!("PIN must be at least 4 characters");
+    // --keyboard: fallback for environments without a controller or display
+    // client (e.g. headless servers, recovery scenarios).
+    if std::env::args().any(|a| a == "--keyboard") {
+        return keyboard_mode();
     }
 
-    let hash = hash_pin(&pin)?;
-    write_hash(&hash)?;
-
-    if !stdin_mode {
-        println!("\nPIN set. Stored (hashed) at {PIN_HASH_PATH}");
-    }
-    Ok(())
+    // Default: controller mode — delegate PIN collection to the daemon.
+    // The daemon opens the controller, shows the set-PIN UI, collects the PIN
+    // twice, and writes the hash.  Requires deckery-auth-daemon + deckery-auth-ui.
+    controller_mode()
 }
 
 fn running_as_root() -> bool {
@@ -114,12 +82,42 @@ fn write_hash(hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send `SET_PIN` to the daemon and wait for the result.
-///
-/// The daemon opens the controller, shows the set-PIN UI, collects the PIN
-/// twice, and writes the hash — this process just triggers it and reports
-/// the outcome.  The daemon independently verifies via SO_PEERCRED that the
-/// caller is root.
+fn stdin_mode() -> Result<()> {
+    let mut line = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("failed to read PIN from stdin")?;
+    let pin = line.trim_end_matches('\n').trim_end_matches('\r');
+    if pin.trim().is_empty() { bail!("PIN must not be empty"); }
+    if pin.len() < 4 { bail!("PIN must be at least 4 characters"); }
+    let hash = hash_pin(pin)?;
+    write_hash(&hash)?;
+    Ok(())
+}
+
+fn keyboard_mode() -> Result<()> {
+    println!("Deckery — controller PIN setup (keyboard fallback)");
+    println!("This PIN is used to authenticate sudo, polkit, and the lock screen");
+    println!("via pam_deckery. It is independent of your login password.\n");
+
+    let pin = rpassword::prompt_password("Enter new PIN: ").context("failed to read PIN")?;
+    let confirm = rpassword::prompt_password("Confirm PIN: ").context("failed to read PIN")?;
+
+    if pin != confirm {
+        bail!("PINs did not match — aborting");
+    }
+    if pin.trim().is_empty() { bail!("PIN must not be empty"); }
+    if pin.len() < 4 { bail!("PIN must be at least 4 characters"); }
+
+    let hash = hash_pin(&pin)?;
+    write_hash(&hash)?;
+    println!("\nPIN set. Stored (hashed) at {PIN_HASH_PATH}");
+    Ok(())
+}
+
+/// Default mode: delegate PIN collection to the daemon (uses the physical
+/// controller + UI overlay).  The daemon verifies SO_PEERCRED independently.
 fn controller_mode() -> Result<()> {
     use std::io::Write;
 

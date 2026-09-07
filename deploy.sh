@@ -246,9 +246,12 @@ s.settimeout(30)
 while True:
     try:
         conn, _ = s.accept()
-        source = conn.makefile('r').readline().strip()
+        f = conn.makefile('r')
+        source = f.readline().strip()
         pin = sudo_pin if source == 'sudo' else test_pin
-        conn.sendall((pin + '\n').encode())
+        # Multi-turn protocol: send PIN:<encoded>, read CORRECT/WRONG from pam_deckery.
+        conn.sendall(('PIN:' + pin + '\n').encode())
+        f.readline()  # consume CORRECT or WRONG (we don't act on it — just one attempt)
         conn.close()
     except Exception:
         break
@@ -369,6 +372,12 @@ echo "    ✓ daemon running"
 echo ""
 echo "==> Installing deckery-auth-ui"
 
+# Stop before copying — running binaries are locked on Linux.
+if systemctl --user is-active --quiet deckery-auth-ui 2>/dev/null; then
+    echo "    stopping deckery-auth-ui"
+    systemctl --user stop deckery-auth-ui
+fi
+
 echo "    cp deckery-auth-ui -> $UI_BIN_INSTALL"
 sudo cp "$UI_BIN_SRC" "$UI_BIN_INSTALL"
 
@@ -400,8 +409,8 @@ echo "    deckery-auth-ui:       $UI_BIN_INSTALL (user service, enabled)"
 echo "    deckery-pin-set:       $PIN_SET_BIN_INSTALL"
 echo "    Active for:            /etc/pam.d/sudo"
 echo ""
-echo "    Set your PIN (keyboard):    sudo deckery-pin-set"
-echo "    Set your PIN (controller):  sudo deckery-pin-set --controller"
+echo "    Set your PIN (controller):  sudo deckery-pin-set"
+echo "    Set your PIN (keyboard):    sudo deckery-pin-set --keyboard"
 echo ""
 echo "    Test controller PIN entry:"
 echo "    sudo systemctl status deckery-auth-daemon"
