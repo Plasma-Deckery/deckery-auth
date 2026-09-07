@@ -31,6 +31,9 @@ ApplicationWindow {
     property bool   finishing:    false
     property bool   showTokens:   true
     property bool   passwordMode: false   // true = keyboard input overlay
+    // Set-PIN mode — active when daemon sends SET_PIN_START.
+    property bool   setPinMode:   false
+    property int    setPinPhase:  1       // 1 = enter, 2 = confirm
 
     // ── DisplayClient polling ─────────────────────────────────────────────────
     Timer {
@@ -66,10 +69,59 @@ ApplicationWindow {
             wrongFlashTimer.restart()
         }
         onSession_ended: { hideTimer.restart() }
+
+        // ── Set-PIN signals ───────────────────────────────────────────────────
+        onSet_pin_started: {
+            console.log("SET_PIN_STARTED")
+            hideTimer.stop()
+            root.setPinMode   = true
+            root.setPinPhase  = 1
+            root.tokens       = []
+            root.statusText   = ""
+            root.finishing    = false
+            root.showTokens   = true
+            root.passwordMode = false
+            root.visible      = true
+        }
+        onSet_pin_phase2: {
+            root.setPinPhase = 2
+            root.tokens      = []
+            root.statusText  = ""
+        }
+        onSet_pin_mismatch: {
+            root.tokens     = []
+            root.statusText = "✗"
+            root.setPinPhase = 1
+            wrongFlashTimer.restart()
+        }
+        onSet_pin_done: {
+            root.statusText = "✓"
+            root.finishing  = true
+            hideTimer.restart()
+        }
+        onSet_pin_cancelled: {
+            root.statusText = "✗"
+            root.finishing  = true
+            hideTimer.restart()
+        }
+        onSet_pin_error: (message) => {
+            console.log("SET_PIN_ERROR:", message)
+            root.statusText = "✗"
+            root.finishing  = true
+            hideTimer.restart()
+        }
     }
 
     Timer { id: hideTimer; interval: 700; repeat: false
-        onTriggered: { root.visible = false; root.tokens = []; root.finishing = false; root.passwordMode = false } }
+        onTriggered: {
+            root.visible      = false
+            root.tokens       = []
+            root.finishing    = false
+            root.passwordMode = false
+            root.setPinMode   = false
+            root.setPinPhase  = 1
+        }
+    }
 
     // Brief ✗ flash on wrong PIN / password — clears after 700 ms without
     // closing the overlay or setting finishing (user can retry immediately).
@@ -139,10 +191,12 @@ ApplicationWindow {
             spacing:                  10
             visible:                  !root.finishing
 
-            // Main heading: "Authentication requested by SUDO"
+            // Main heading — varies by mode and phase
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text:                "Authentication requested by " + root.authSource
+                text: root.setPinMode
+                    ? (root.setPinPhase === 1 ? "Set new PIN" : "Confirm new PIN")
+                    : ("Authentication requested by " + root.authSource)
                 color:               "#cdd6f4"
                 font.pixelSize:      22
                 font.bold:           true
@@ -150,10 +204,11 @@ ApplicationWindow {
                 font.letterSpacing:  2
             }
 
-            // Switch to Password
+            // Switch to Password — hidden in set-PIN mode
             Rectangle {
                 anchors.horizontalCenter: parent.horizontalCenter
                 width:  180; height: 30; radius: 15
+                visible:      !root.setPinMode
                 color:        kbBtn.containsMouse ? "#40cdd6f4" : "#201e1e2e"
                 border.color: "#585b70"; border.width: 1
                 Text {

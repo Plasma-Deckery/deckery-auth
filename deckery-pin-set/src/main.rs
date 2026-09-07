@@ -12,6 +12,9 @@ use std::path::Path;
 /// root (invoked from the PAM stack) so this is fine.
 const PIN_HASH_PATH: &str = "/etc/deckery/pin.hash";
 
+/// Root-only auth socket — daemon's address.
+const AUTH_SOCKET_PATH: &str = "/run/deckery/auth.sock";
+
 /// Argon2id parameters. This check happens rarely (interactive auth, not an
 /// API endpoint) and locally, so we can afford to go well above the OWASP
 /// minimums without any noticeable UX cost.
@@ -24,6 +27,13 @@ const ARGON2_P_COST: u32 = 4;
 fn main() -> Result<()> {
     if !running_as_root() {
         bail!("deckery-pin-set must be run as root (use sudo)");
+    }
+
+    // --controller: delegate PIN collection to the daemon (uses the physical
+    // controller instead of the keyboard).  The daemon verifies SO_PEERCRED
+    // independently — this check is just an early-exit with a clear message.
+    if std::env::args().any(|a| a == "--controller") {
+        return controller_mode();
     }
 
     let stdin_mode = std::env::args().any(|a| a == "--stdin");
@@ -102,4 +112,41 @@ fn write_hash(hash: &str) -> Result<()> {
         .with_context(|| format!("failed to set permissions on {PIN_HASH_PATH}"))?;
 
     Ok(())
+}
+
+/// Send `SET_PIN` to the daemon and wait for the result.
+///
+/// The daemon opens the controller, shows the set-PIN UI, collects the PIN
+/// twice, and writes the hash — this process just triggers it and reports
+/// the outcome.  The daemon independently verifies via SO_PEERCRED that the
+/// caller is root.
+fn controller_mode() -> Result<()> {
+    use std::io::Write;
+
+    println!("Deckery — controller PIN setup");
+    println!("The daemon will show the PIN entry UI on the connected display.");
+    println!("Enter your new PIN twice using the controller.\n");
+
+    let mut stream = std::os::unix::net::UnixStream::connect(AUTH_SOCKET_PATH)
+        .context("cannot connect to deckery-auth-daemon — is it running?")?;
+
+    writeln!(stream, "SET_PIN").context("send SET_PIN")?;
+
+    // Block until the daemon responds — the user is entering the PIN now.
+    let mut response = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut response)
+        .context("read daemon response")?;
+
+    match response.trim() {
+        "PIN_SET" => {
+            println!("PIN set successfully.");
+            Ok(())
+        }
+        "CANCEL" => bail!("PIN setup cancelled."),
+        s if s.starts_with("ERROR:") => {
+            bail!("{}", s.strip_prefix("ERROR:").unwrap_or(s))
+        }
+        other => bail!("unexpected daemon response: {other}"),
+    }
 }

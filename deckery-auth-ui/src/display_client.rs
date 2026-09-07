@@ -28,6 +28,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug)]
 enum Event {
+    // ── Normal auth events ────────────────────────────────────────────────────
     /// Source name + session ID.
     SessionStart(String, u64),
     Token(String),
@@ -40,6 +41,19 @@ enum Event {
     WrongPassword(u64),
     /// Session ID — only the owning UI reacts.
     SessionEnd(u64),
+    // ── Set-PIN events ────────────────────────────────────────────────────────
+    /// Phase 1: enter new PIN.
+    SetPinStart,
+    /// Phase 2: re-enter PIN to confirm.
+    SetPinPhase2,
+    /// Entries did not match — UI shows ✗ and restarts phase 1.
+    SetPinMismatch,
+    /// PIN saved — UI shows ✓ briefly then closes.
+    SetPinDone,
+    /// User cancelled — UI closes.
+    SetPinCancel,
+    /// Unrecoverable error — UI shows message and closes.
+    SetPinError(String),
 }
 
 fn parse_line(line: &str) -> Option<Event> {
@@ -59,6 +73,18 @@ fn parse_line(line: &str) -> Option<Event> {
         Some(Event::WrongPassword(id_str.parse().ok()?))
     } else if let Some(id_str) = line.strip_prefix("SESSION_END:") {
         Some(Event::SessionEnd(id_str.parse().ok()?))
+    } else if line == "SET_PIN_START" {
+        Some(Event::SetPinStart)
+    } else if line == "SET_PIN_PHASE2" {
+        Some(Event::SetPinPhase2)
+    } else if line == "SET_PIN_MISMATCH" {
+        Some(Event::SetPinMismatch)
+    } else if line == "SET_PIN_DONE" {
+        Some(Event::SetPinDone)
+    } else if line == "SET_PIN_CANCEL" {
+        Some(Event::SetPinCancel)
+    } else if let Some(msg) = line.strip_prefix("SET_PIN_ERROR:") {
+        Some(Event::SetPinError(msg.to_owned()))
     } else {
         None
     }
@@ -124,6 +150,32 @@ pub mod ffi {
 
         #[qsignal]
         fn session_ended(self: Pin<&mut DisplayClient>);
+
+        // ── Set-PIN signals ───────────────────────────────────────────────────
+
+        /// Phase 1: enter new PIN.
+        #[qsignal]
+        fn set_pin_started(self: Pin<&mut DisplayClient>);
+
+        /// Phase 2: re-enter PIN to confirm.
+        #[qsignal]
+        fn set_pin_phase2(self: Pin<&mut DisplayClient>);
+
+        /// The two entries did not match.
+        #[qsignal]
+        fn set_pin_mismatch(self: Pin<&mut DisplayClient>);
+
+        /// PIN saved — close UI after brief success display.
+        #[qsignal]
+        fn set_pin_done(self: Pin<&mut DisplayClient>);
+
+        /// User cancelled set-PIN — close UI.
+        #[qsignal]
+        fn set_pin_cancelled(self: Pin<&mut DisplayClient>);
+
+        /// Unrecoverable error during set-PIN.
+        #[qsignal]
+        fn set_pin_error(self: Pin<&mut DisplayClient>, message: QString);
 
         #[qinvokable]
         fn start_listening(self: Pin<&mut DisplayClient>);
@@ -196,6 +248,13 @@ impl ffi::DisplayClient {
                     => self.as_mut().session_ended(),
                 Event::Confirm(_) | Event::Cancel(_) | Event::WrongPassword(_)
                 | Event::SessionEnd(_) => {}
+                // Set-PIN events (no session_id — these are global).
+                Event::SetPinStart     => self.as_mut().set_pin_started(),
+                Event::SetPinPhase2    => self.as_mut().set_pin_phase2(),
+                Event::SetPinMismatch  => self.as_mut().set_pin_mismatch(),
+                Event::SetPinDone      => self.as_mut().set_pin_done(),
+                Event::SetPinCancel    => self.as_mut().set_pin_cancelled(),
+                Event::SetPinError(e)  => self.as_mut().set_pin_error(QString::from(&e)),
             }
         }
     }

@@ -93,11 +93,25 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+    Argon2, Params, Version,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use deckery_input::{ControlAction, Token, TokenReader, encode_sequence};
+
+// ── PIN hash constants (shared with deckery-pin-set) ─────────────────────────
+
+/// Where the PIN hash lives. Root-only (0600) — pam_deckery runs as root.
+const PIN_HASH_PATH: &str = "/etc/deckery/pin.hash";
+
+// Argon2id parameters — affordable on idle hardware, well above OWASP minimums.
+const ARGON2_M_COST: u32 = 65536; // 64 MiB
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 4;
 
 // ── Makima pause / resume ─────────────────────────────────────────────────────
 
@@ -198,6 +212,7 @@ enum VerifyMsg {
 
 #[derive(Debug, Clone)]
 enum DisplayEvent {
+    // ── Normal auth events ────────────────────────────────────────────────────
     SessionStart(String, u64),
     Token(String),
     Backspace,
@@ -206,6 +221,19 @@ enum DisplayEvent {
     /// Verification failed — overlay shows ✗ briefly and stays open for retry.
     WrongPassword(u64),
     SessionEnd(u64),
+    // ── Set-PIN events ────────────────────────────────────────────────────────
+    /// Phase 1: enter new PIN.
+    SetPinStart,
+    /// Phase 2: re-enter PIN to confirm.
+    SetPinPhase2,
+    /// The two entries did not match — UI shows ✗ and restarts phase 1.
+    SetPinMismatch,
+    /// PIN saved successfully — UI shows ✓ briefly then closes.
+    SetPinDone,
+    /// User pressed Cancel during set-PIN — UI closes.
+    SetPinCancel,
+    /// Unrecoverable error during set-PIN (e.g. controller unavailable).
+    SetPinError(String),
 }
 
 impl DisplayEvent {
@@ -218,6 +246,12 @@ impl DisplayEvent {
             DisplayEvent::Cancel(id)            => format!("CANCEL:{id}\n"),
             DisplayEvent::WrongPassword(id)     => format!("WRONG_PASSWORD:{id}\n"),
             DisplayEvent::SessionEnd(id)        => format!("SESSION_END:{id}\n"),
+            DisplayEvent::SetPinStart           => "SET_PIN_START\n".to_string(),
+            DisplayEvent::SetPinPhase2          => "SET_PIN_PHASE2\n".to_string(),
+            DisplayEvent::SetPinMismatch        => "SET_PIN_MISMATCH\n".to_string(),
+            DisplayEvent::SetPinDone            => "SET_PIN_DONE\n".to_string(),
+            DisplayEvent::SetPinCancel          => "SET_PIN_CANCEL\n".to_string(),
+            DisplayEvent::SetPinError(e)        => format!("SET_PIN_ERROR:{e}\n"),
         }
     }
 }
@@ -369,9 +403,9 @@ async fn main() -> Result<()> {
         active_session.clone(),
     ));
     tokio::spawn(display_accept_loop(
-        display_tx, ui_cancel_tx, ui_password_tx, active_session,
+        display_tx.clone(), ui_cancel_tx, ui_password_tx, active_session,
     ));
-    auth_accept_loop(listener, queue, notify).await;
+    auth_accept_loop(listener, queue, notify, display_tx).await;
 
     Ok(())
 }
@@ -473,30 +507,41 @@ async fn handle_display_connection(
 // ── Auth acceptor ─────────────────────────────────────────────────────────────
 
 async fn auth_accept_loop(
-    listener: UnixListener,
-    queue:    Arc<Mutex<Queue>>,
-    notify:   Arc<Notify>,
+    listener:   UnixListener,
+    queue:      Arc<Mutex<Queue>>,
+    notify:     Arc<Notify>,
+    display_tx: broadcast::Sender<DisplayEvent>,
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => tokio::spawn(handle_incoming(stream, queue.clone(), notify.clone())),
-            Err(e)          => { eprintln!("deckery-auth-daemon: accept error: {e}"); continue; }
+            Ok((stream, _)) => tokio::spawn(handle_incoming(
+                stream, queue.clone(), notify.clone(), display_tx.clone(),
+            )),
+            Err(e) => { eprintln!("deckery-auth-daemon: accept error: {e}"); continue; }
         };
     }
 }
 
-/// Handles one pam_deckery connection.
+/// Handles one connection on `auth.sock`.
 ///
-/// Reads the source name, registers with the queue, then mediates the
-/// multi-turn protocol between the socket (pam_deckery) and the worker
-/// (`collect_pin`):
+/// Reads the first line to determine the request type:
+/// - `"SET_PIN"` → [`handle_set_pin`] (root-only, controller-based PIN setup)
+/// - anything else → treated as PAM source name and added to the auth queue
+///
+/// For the normal PAM flow the function mediates the multi-turn protocol
+/// between the socket (pam_deckery) and the worker (`collect_pin`):
 ///
 /// ```text
 /// worker ──AttemptMsg──► handle_incoming ──PIN:/KBD:/CANCEL/ERROR──► pam_deckery
 /// worker ◄──VerifyMsg─── handle_incoming ◄──────CORRECT/WRONG──────── pam_deckery
 /// ```
-async fn handle_incoming(mut stream: UnixStream, queue: Arc<Mutex<Queue>>, notify: Arc<Notify>) {
-    // Read source name.
+async fn handle_incoming(
+    mut stream: UnixStream,
+    queue:      Arc<Mutex<Queue>>,
+    notify:     Arc<Notify>,
+    display_tx: broadcast::Sender<DisplayEvent>,
+) {
+    // Read first line — determines the request type.
     let source = {
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
@@ -508,6 +553,12 @@ async fn handle_incoming(mut stream: UnixStream, queue: Arc<Mutex<Queue>>, notif
             Ok(_) => line.trim().to_string(),
         }
     };
+
+    // SET_PIN is a privileged out-of-band command — not an auth session.
+    if source == "SET_PIN" {
+        handle_set_pin(stream, display_tx).await;
+        return;
+    }
 
     let priority = priority_for_source(&source);
 
@@ -588,6 +639,173 @@ async fn handle_incoming(mut stream: UnixStream, queue: Arc<Mutex<Queue>>, notif
         }
         // Wrong → loop: wait for worker to send next AttemptMsg.
     }
+}
+
+// ── SET_PIN handler ───────────────────────────────────────────────────────────
+
+/// Handle a `SET_PIN` command from `auth.sock`.
+///
+/// Security invariants:
+/// - The caller's UID is verified via `SO_PEERCRED` — only root (UID 0) is
+///   allowed.  `auth.sock` is 0600 so non-root cannot even connect, but
+///   `SO_PEERCRED` adds a defence-in-depth layer that is unforgeable.
+/// - At least one display client must be connected — otherwise the user would
+///   have no way to see the token display or enter the PIN.
+async fn handle_set_pin(
+    mut stream: UnixStream,
+    display_tx: broadcast::Sender<DisplayEvent>,
+) {
+    // Verify caller is root via SO_PEERCRED.
+    match stream.peer_cred() {
+        Err(e) => {
+            eprintln!("deckery-auth-daemon: SET_PIN peer_cred failed: {e}");
+            let _ = stream.write_all(b"ERROR:internal\n").await;
+            return;
+        }
+        Ok(cred) if cred.uid() != 0 => {
+            eprintln!("deckery-auth-daemon: SET_PIN rejected — caller uid={}", cred.uid());
+            let _ = stream.write_all(b"ERROR:permission denied\n").await;
+            return;
+        }
+        Ok(_) => {}
+    }
+
+    // Require an active display client (user needs to see the UI).
+    if display_tx.receiver_count() == 0 {
+        eprintln!("deckery-auth-daemon: SET_PIN rejected — no display client connected");
+        let _ = stream.write_all(b"ERROR:no display client connected\n").await;
+        return;
+    }
+
+    eprintln!("deckery-auth-daemon: entering SET_PIN mode");
+    let _makima_pause = MakimaPause::pause();
+
+    match collect_pin_set(&display_tx).await {
+        Ok(()) => {
+            eprintln!("deckery-auth-daemon: SET_PIN complete");
+            let _ = stream.write_all(b"PIN_SET\n").await;
+        }
+        Err(SetPinError::Cancel) => {
+            eprintln!("deckery-auth-daemon: SET_PIN cancelled by user");
+            let _ = stream.write_all(b"CANCEL\n").await;
+        }
+        Err(SetPinError::Controller(e)) => {
+            eprintln!("deckery-auth-daemon: SET_PIN controller error: {e:#}");
+            let _ = display_tx.send(DisplayEvent::SetPinError(e.to_string()));
+            let _ = stream.write_all(format!("ERROR:{e}\n").as_bytes()).await;
+        }
+        Err(SetPinError::Write(e)) => {
+            eprintln!("deckery-auth-daemon: SET_PIN write error: {e:#}");
+            let _ = display_tx.send(DisplayEvent::SetPinError(e.to_string()));
+            let _ = stream.write_all(format!("ERROR:{e}\n").as_bytes()).await;
+        }
+    }
+}
+
+enum SetPinError {
+    Cancel,
+    Controller(anyhow::Error),
+    Write(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SetPinError {
+    fn from(e: anyhow::Error) -> Self { SetPinError::Controller(e) }
+}
+
+/// Collect the PIN twice from the controller, compare, and write the hash.
+///
+/// Loops on mismatch — the user can try again without re-running the command.
+/// Returns `Err(Cancel)` if the user presses Cancel at any point.
+async fn collect_pin_set(
+    display_tx: &broadcast::Sender<DisplayEvent>,
+) -> Result<(), SetPinError> {
+    let mut reader = TokenReader::open().await
+        .map_err(|e| SetPinError::Controller(e.into()))?;
+
+    eprintln!("deckery-auth-daemon: SET_PIN controller on {}", reader.path().display());
+
+    loop {
+        // Phase 1 — enter new PIN.
+        let _ = display_tx.send(DisplayEvent::SetPinStart);
+        let first = collect_one_pin_set(&mut reader, display_tx).await?;
+
+        // Phase 2 — confirm.
+        let _ = display_tx.send(DisplayEvent::SetPinPhase2);
+        let second = collect_one_pin_set(&mut reader, display_tx).await?;
+
+        if first == second {
+            // Hash and write.
+            let hash = hash_pin_for_set(&first)
+                .map_err(SetPinError::Write)?;
+            write_pin_hash(&hash)
+                .map_err(SetPinError::Write)?;
+            let _ = display_tx.send(DisplayEvent::SetPinDone);
+            return Ok(());
+        } else {
+            // Mismatch — show error and restart phase 1.
+            eprintln!("deckery-auth-daemon: SET_PIN mismatch — restarting");
+            let _ = display_tx.send(DisplayEvent::SetPinMismatch);
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        }
+    }
+}
+
+/// Collect tokens until Confirm or Cancel.  Returns encoded sequence on
+/// Confirm, or `Err(Cancel)` when the user presses Cancel.
+async fn collect_one_pin_set(
+    reader:     &mut TokenReader,
+    display_tx: &broadcast::Sender<DisplayEvent>,
+) -> Result<String, SetPinError> {
+    let mut tokens: Vec<Token> = Vec::new();
+    loop {
+        let token = reader.next_token().await
+            .map_err(|e| SetPinError::Controller(e.into()))?;
+        match token {
+            Token::Control(ControlAction::Confirm) => {
+                return Ok(encode_sequence(&tokens));
+            }
+            Token::Control(ControlAction::Cancel) => {
+                let _ = display_tx.send(DisplayEvent::SetPinCancel);
+                return Err(SetPinError::Cancel);
+            }
+            Token::Control(ControlAction::Backspace) => {
+                tokens.pop();
+                let _ = display_tx.send(DisplayEvent::Backspace);
+            }
+            Token::Release(_) => {}
+            t @ Token::Chord(_) => {
+                let encoded = t.encode();
+                let _ = display_tx.send(DisplayEvent::Token(encoded));
+                tokens.push(t);
+            }
+        }
+    }
+}
+
+fn hash_pin_for_set(encoded: &str) -> Result<String> {
+    let salt   = SaltString::generate(&mut OsRng);
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, None)
+        .map_err(|e| anyhow::anyhow!("argon2 params: {e}"))?;
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
+    let hash   = argon2
+        .hash_password(encoded.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("argon2 hash: {e}"))?;
+    Ok(hash.to_string())
+}
+
+fn write_pin_hash(hash: &str) -> Result<()> {
+    use std::fs;
+    let dir = std::path::Path::new(PIN_HASH_PATH)
+        .parent()
+        .expect("PIN_HASH_PATH has parent");
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    fs::write(PIN_HASH_PATH, hash)
+        .with_context(|| format!("write {PIN_HASH_PATH}"))?;
+    fs::set_permissions(PIN_HASH_PATH, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 600 {PIN_HASH_PATH}"))?;
+    eprintln!("deckery-auth-daemon: PIN hash written to {PIN_HASH_PATH}");
+    Ok(())
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
