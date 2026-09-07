@@ -35,6 +35,24 @@ ApplicationWindow {
     property bool   setPinMode:   false
     property int    setPinPhase:  1       // 1 = enter, 2 = confirm
 
+    // ── Timers — declared before DisplayClient so their IDs are in the QML
+    //    context when DisplayClient's signal handlers run during finalization.
+    Timer { id: hideTimer; interval: 700; repeat: false
+        onTriggered: {
+            root.visible      = false
+            root.tokens       = []
+            root.finishing    = false
+            root.passwordMode = false
+            root.setPinMode   = false
+            root.setPinPhase  = 1
+        }
+    }
+
+    // Brief ✗ flash on wrong PIN / password — clears after 700 ms without
+    // closing the overlay or setting finishing (user can retry immediately).
+    Timer { id: wrongFlashTimer; interval: 700; repeat: false
+        onTriggered: { if (!root.finishing) root.statusText = "" } }
+
     // ── DisplayClient polling ─────────────────────────────────────────────────
     Timer {
         interval: 50; repeat: true; running: true
@@ -111,22 +129,6 @@ ApplicationWindow {
             hideTimer.restart()
         }
     }
-
-    Timer { id: hideTimer; interval: 700; repeat: false
-        onTriggered: {
-            root.visible      = false
-            root.tokens       = []
-            root.finishing    = false
-            root.passwordMode = false
-            root.setPinMode   = false
-            root.setPinPhase  = 1
-        }
-    }
-
-    // Brief ✗ flash on wrong PIN / password — clears after 700 ms without
-    // closing the overlay or setting finishing (user can retry immediately).
-    Timer { id: wrongFlashTimer; interval: 700; repeat: false
-        onTriggered: { if (!root.finishing) root.statusText = "" } }
 
     // ── Full-screen scrim ─────────────────────────────────────────────────────
     Rectangle {
