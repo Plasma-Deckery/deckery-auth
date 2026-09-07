@@ -46,6 +46,7 @@ done
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 DISTROBOX="deckery"
+DISTROBOX_UI="deckery-ui-build"
 
 SO_SRC="$SCRIPT_DIR/target/release/libpam_deckery.so"
 PIN_SET_BIN="$SCRIPT_DIR/target/release/deckery-pin-set"
@@ -59,6 +60,7 @@ DEV_PAM_SO="$DEV_PAM_DIR/pam_deckery.so"
 DAEMON_BIN_INSTALL="/usr/local/bin/deckery-auth-daemon"
 DAEMON_SERVICE_SRC="$SCRIPT_DIR/deckery-auth-daemon.service"
 DAEMON_SERVICE_INSTALL="/etc/systemd/system/deckery-auth-daemon.service"
+PIN_SET_BIN_INSTALL="/usr/local/bin/deckery-pin-set"
 UI_BIN_INSTALL="/usr/local/bin/deckery-auth-ui"
 UI_SERVICE_SRC="$SCRIPT_DIR/deckery-auth-ui.service"
 UI_SERVICE_INSTALL="/etc/systemd/user/deckery-auth-ui.service"
@@ -131,6 +133,14 @@ if [[ "$UNINSTALL" == true ]]; then
         echo "    (not present — skipped)"
     fi
 
+    echo "    removing $PIN_SET_BIN_INSTALL"
+    if [[ -f "$PIN_SET_BIN_INSTALL" ]]; then
+        sudo rm "$PIN_SET_BIN_INSTALL"
+        echo "    ✓ removed"
+    else
+        echo "    (not present — skipped)"
+    fi
+
     echo ""
     echo "    NOTE: /etc/deckery/pin.hash was NOT removed."
     echo "    Remove manually if needed: sudo rm $HASH_FILE"
@@ -141,8 +151,19 @@ fi
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
-echo "==> Building (distrobox: $DISTROBOX)"
-distrobox enter "$DISTROBOX" -- cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
+# PAM, daemon, pin-set: built in the system/Rust distrobox (no Qt needed).
+# UI: built in the Qt distrobox (needs Qt 6.10+, lives in deckery-ui-build).
+# The polkit-agent is excluded — it's not yet functional and pulls in a zbus
+# version that requires a newer rustc than the deckery distrobox provides.
+
+echo "==> Building PAM / daemon / pin-set (distrobox: $DISTROBOX)"
+distrobox enter "$DISTROBOX" -- cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+    -p deckery-pam -p deckery-pam-test -p deckery-auth-daemon -p deckery-pin-set
+
+echo ""
+echo "==> Building UI (distrobox: $DISTROBOX_UI)"
+distrobox enter "$DISTROBOX_UI" -- cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+    -p deckery-auth-ui
 
 if [[ "$MODE" == "rpm" ]]; then
     echo ""
@@ -359,6 +380,15 @@ echo "    enabling and starting deckery-auth-ui"
 systemctl --user enable --now deckery-auth-ui
 echo "    ✓ UI running"
 
+# ── Install deckery-pin-set ───────────────────────────────────────────────────
+
+echo ""
+echo "==> Installing deckery-pin-set"
+
+echo "    cp deckery-pin-set -> $PIN_SET_BIN_INSTALL"
+sudo cp "$PIN_SET_BIN" "$PIN_SET_BIN_INSTALL"
+echo "    ✓ installed"
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -367,10 +397,11 @@ echo ""
 echo "    pam_deckery.so:        $DEV_PAM_SO"
 echo "    deckery-auth-daemon:   $DAEMON_BIN_INSTALL (system service, enabled)"
 echo "    deckery-auth-ui:       $UI_BIN_INSTALL (user service, enabled)"
+echo "    deckery-pin-set:       $PIN_SET_BIN_INSTALL"
 echo "    Active for:            /etc/pam.d/sudo"
 echo ""
-echo "    Set your real PIN:"
-echo "    sudo $PIN_SET_BIN"
+echo "    Set your PIN (keyboard):    sudo deckery-pin-set"
+echo "    Set your PIN (controller):  sudo deckery-pin-set --controller"
 echo ""
 echo "    Test controller PIN entry:"
 echo "    sudo systemctl status deckery-auth-daemon"
