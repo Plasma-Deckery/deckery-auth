@@ -56,8 +56,9 @@ escalate_for_install() {
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 DISTROBOX_UI="deckery-ui-build"
+TARGET_FEDORA="$SCRIPT_DIR/target-fedora"
 
-POLKIT_AGENT_BIN_SRC="$SCRIPT_DIR/target/release/deckery-polkit-agent"
+POLKIT_AGENT_BIN_SRC="$TARGET_FEDORA/release/deckery-polkit-agent"
 POLKIT_AGENT_BIN_INSTALL="/usr/local/bin/deckery-polkit-agent"
 POLKIT_AGENT_SERVICE_SRC="$SCRIPT_DIR/deckery-polkit-agent.service"
 POLKIT_AGENT_SERVICE_INSTALL="/etc/systemd/user/deckery-polkit-agent.service"
@@ -130,9 +131,9 @@ fi
 # ── Build (user phase) ────────────────────────────────────────────────────────
 
 if [[ "$INSTALL_PHASE" != "1" ]]; then
-    echo "==> Building deckery-polkit-agent (distrobox: $DISTROBOX_UI)"
+    echo "==> Building deckery-polkit-agent (distrobox: $DISTROBOX_UI, target: target-fedora)"
     distrobox enter "$DISTROBOX_UI" -- bash -c \
-        "cd '$SCRIPT_DIR' && cargo build --release -p deckery-polkit-agent"
+        "cd '$SCRIPT_DIR' && CARGO_TARGET_DIR='$TARGET_FEDORA' cargo build --release -p deckery-polkit-agent"
 
     echo ""
     echo "==> Build complete. Escalating for install…"

@@ -99,12 +99,17 @@ done
 DISTROBOX="deckery"
 DISTROBOX_UI="deckery-ui-build"
 
-SO_SRC="$SCRIPT_DIR/target/release/libpam_deckery.so"
-PIN_SET_BIN="$SCRIPT_DIR/target/release/deckery-pin-set"
-PAM_TEST_BIN="$SCRIPT_DIR/target/release/deckery-pam-test"
-DAEMON_BIN_SRC="$SCRIPT_DIR/target/release/deckery-auth-daemon"
-UI_BIN_SRC="$SCRIPT_DIR/target/release/deckery-auth-ui"
-POLKIT_AGENT_BIN_SRC="$SCRIPT_DIR/target/release/deckery-polkit-agent"
+# Each distrobox writes to its own target directory so Arch (glibc 2.43) and
+# Fedora (glibc 2.42) artefacts never cross-contaminate each other.
+TARGET_ARCH="$SCRIPT_DIR/target-arch"
+TARGET_FEDORA="$SCRIPT_DIR/target-fedora"
+
+SO_SRC="$TARGET_ARCH/release/libpam_deckery.so"
+PIN_SET_BIN="$TARGET_ARCH/release/deckery-pin-set"
+PAM_TEST_BIN="$TARGET_ARCH/release/deckery-pam-test"
+DAEMON_BIN_SRC="$TARGET_ARCH/release/deckery-auth-daemon"
+UI_BIN_SRC="$TARGET_FEDORA/release/deckery-auth-ui"
+POLKIT_AGENT_BIN_SRC="$TARGET_FEDORA/release/deckery-polkit-agent"
 INSTALL_SCRIPT="$SCRIPT_DIR/configure-pam.sh"
 
 DEV_PAM_DIR="/usr/local/lib/security"
@@ -240,17 +245,17 @@ fi
 # polkit-agent: has its own deploy-polkit.sh — not built here.
 
 if [[ "$INSTALL_PHASE" != "1" ]]; then
-    echo "==> Building PAM / daemon / pin-set (distrobox: $DISTROBOX)"
+    echo "==> Building PAM / daemon / pin-set (distrobox: $DISTROBOX, target: target-arch)"
     distrobox enter "$DISTROBOX" -- \
+        env CARGO_TARGET_DIR="$TARGET_ARCH" \
         cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" \
         -p deckery-pam -p deckery-pam-test -p deckery-auth-daemon -p deckery-pin-set \
         -p deckery-input --bin deckery-input-test
 
     echo ""
-    echo "==> Building UI (distrobox: $DISTROBOX_UI)"
+    echo "==> Building UI (distrobox: $DISTROBOX_UI, target: target-fedora)"
     distrobox enter "$DISTROBOX_UI" -- \
-        cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" \
-        -p deckery-auth-ui
+        bash -c "cd '$SCRIPT_DIR' && CARGO_TARGET_DIR='$TARGET_FEDORA' cargo build --release -p deckery-auth-ui"
 
     if [[ "$MODE" == "rpm" ]]; then
         echo ""
