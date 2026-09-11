@@ -30,8 +30,8 @@ fn key_to_button(key: Key) -> Option<Button> {
     match key {
         Key::BTN_SOUTH  => Some(Button::A),
         Key::BTN_EAST   => Some(Button::B),
-        Key::BTN_NORTH  => Some(Button::X),  // BTN_NORTH = 0x133 = BTN_X alias
-        Key::BTN_WEST   => Some(Button::Y),  // BTN_WEST  = 0x134 = BTN_Y alias
+        Key::BTN_NORTH  => Some(Button::Y),
+        Key::BTN_WEST   => Some(Button::X),
         // Shoulder buttons — regular buttons, not special modifiers.
         Key::BTN_TL     => Some(Button::L1),
         Key::BTN_TR     => Some(Button::R1),
@@ -247,8 +247,8 @@ mod tests {
         for (key, btn) in [
             (Key::BTN_SOUTH, Button::A),
             (Key::BTN_EAST,  Button::B),
-            (Key::BTN_NORTH, Button::X),
-            (Key::BTN_WEST,  Button::Y),
+            (Key::BTN_NORTH, Button::Y),
+            (Key::BTN_WEST,  Button::X),
         ] {
             tx.send(press(key)).await.unwrap();
             assert_eq!(reader.next_token().await.unwrap(), chord(&[btn]));
