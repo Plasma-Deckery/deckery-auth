@@ -1,411 +1,230 @@
-//! `deckery-polkit-agent` — polkit authentication agent for Deckery.
+//! `deckery-polkit-agent` — thin polkit authentication agent.
 //!
-//! Replaces the Plasma built-in polkit agent. Shows a Layer Shell popup
-//! when an application requests authorization via polkit. Supports:
-//!   - Password authentication via pam_unix.so (keyboard / virtual keyboard)
-//!   - PIN authentication via pam_deckery.so (controller button combos — Step 3)
+//! Registers with polkitd on D-Bus and forwards every `BeginAuthentication`
+//! request to the running `deckery-auth-daemon` via `pam_authenticate(3)`.
+//! pam_deckery.so (in the polkit-1 PAM stack) connects to the daemon socket;
+//! the existing `deckery-auth-ui` overlay handles all user interaction.
 //!
-//! Registers with polkitd at startup via polkit-agent-rs (libpolkit-agent-1).
-//! Uses iced_layershell for the Wayland Layer Shell surface.
-//!
-//! Based on manthanabc/polkit-agent (MIT License).
-//! See: https://github.com/Plasma-Deckery/deckery-auth/issues/6
+//! No GUI lives in this binary — it is a pure relay.
 
-use iced::window::Id;
-use iced::{Element, Event, Task as Command, event};
-use iced_runtime::window::Action as WindowAction;
-use iced_runtime::{Action, task};
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
-use iced_layershell::build_pattern::{MainSettings, daemon};
-use iced_layershell::reexport::{Anchor, Layer, NewLayerShellSettings};
-use iced_layershell::settings::{LayerShellSettings, StartMode};
-use iced_layershell::to_layer_message;
-use polkit_agent_rs::polkit::UnixUser;
-use std::collections::BTreeMap;
+use anyhow::{Context, Result};
+use pam_client2::{Context as PamContext, Flag};
+use pam_client2::conv_null::Conversation as NullConv;
+use tokio::sync::oneshot;
+use tracing::{info, warn};
+use zbus::{connection, interface, proxy};
+use zbus::zvariant::{OwnedValue, Value};
 
-use futures::channel::mpsc::Sender;
-use iced::widget::{Space, button, column, pick_list, row, text, text_input};
-use iced::{Bottom, Center, Fill};
-use polkit_agent_rs::RegisterFlags;
-use polkit_agent_rs::Session as AgentSession;
-use polkit_agent_rs::gio;
-use polkit_agent_rs::polkit::UnixSession;
-use polkit_agent_rs::traits::ListenerExt;
-use std::sync::Arc;
-use std::sync::Mutex;
+// ── polkitd proxy ─────────────────────────────────────────────────────────────
 
-mod listener;
-use listener::DeckeryListener;
+#[proxy(
+    interface = "org.freedesktop.PolicyKit1.Authority",
+    default_service = "org.freedesktop.PolicyKit1",
+    default_path = "/org/freedesktop/PolicyKit1/Authority"
+)]
+trait Authority {
+    fn register_authentication_agent_with_options(
+        &self,
+        subject: (String, HashMap<String, OwnedValue>),
+        locale: &str,
+        object_path: &str,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    fn authentication_agent_response2(
+        &self,
+        uid: u32,
+        cookie: &str,
+        identity: (String, HashMap<String, OwnedValue>),
+    ) -> zbus::Result<()>;
+}
+
+// ── cancel map ────────────────────────────────────────────────────────────────
+
+type CancelMap = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
+
+// ── agent interface ───────────────────────────────────────────────────────────
+
+struct DeckeryAgent {
+    conn: zbus::Connection,
+    pending: CancelMap,
+}
+
+#[interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
+impl DeckeryAgent {
+    async fn begin_authentication(
+        &self,
+        action_id: String,
+        _message: String,
+        _icon_name: String,
+        _details: HashMap<String, String>,
+        cookie: String,
+        identities: Vec<(String, HashMap<String, OwnedValue>)>,
+    ) {
+        let (uid, username) = match extract_unix_user(&identities) {
+            Some(v) => v,
+            None => {
+                warn!("begin_authentication: no unix-user identity found");
+                return;
+            }
+        };
+
+        info!("polkit auth: action={action_id} user={username}");
+
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        self.pending.lock().unwrap().insert(cookie.clone(), cancel_tx);
+
+        let conn = self.conn.clone();
+        let pending = self.pending.clone();
+        let identity = identities.into_iter().next().unwrap();
+
+        tokio::task::spawn_blocking(move || {
+            // Blocks until pam_deckery.so + daemon finish auth.
+            let pam_result = run_pam_auth("polkit-1", &username);
+
+            pending.lock().unwrap().remove(&cookie);
+
+            if cancel_rx.try_recv().is_ok() {
+                info!("auth for {username} cancelled");
+                return;
+            }
+
+            match pam_result {
+                Ok(()) => {
+                    let rt = tokio::runtime::Handle::current();
+                    let _ = rt.block_on(async {
+                        report_success(&conn, uid, &cookie, identity).await
+                    });
+                }
+                Err(e) => {
+                    info!("auth for {username} failed: {e}");
+                }
+            }
+        });
+    }
+
+    async fn cancel_authentication(&self, cookie: String) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&cookie) {
+            let _ = tx.send(());
+        }
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn extract_unix_user(
+    identities: &[(String, HashMap<String, OwnedValue>)],
+) -> Option<(u32, String)> {
+    for (kind, props) in identities {
+        if kind == "unix-user" {
+            if let Some(val) = props.get("uid") {
+                if let Value::U32(uid) = val.deref() {
+                    let username = uid_to_name(*uid).unwrap_or_else(|| uid.to_string());
+                    return Some((*uid, username));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn uid_to_name(uid: u32) -> Option<String> {
+    let mut buf = vec![0i8; 1024];
+    let mut result = std::ptr::null_mut();
+    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let ret = unsafe {
+        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    };
+    if ret != 0 || result.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+    Some(name.to_string_lossy().into_owned())
+}
+
+/// Call pam_authenticate for polkit-1. pam_deckery.so handles the actual
+/// interaction via the daemon — NullConversation is intentional (no prompts
+/// expected from pam_deckery.so; if daemon is down, auth fails cleanly).
+fn run_pam_auth(service: &str, username: &str) -> Result<()> {
+    let conv = NullConv::new();
+    let mut ctx = PamContext::new(service, Some(username), conv)
+        .context("pam_start failed")?;
+    ctx.authenticate(Flag::NONE).context("pam_authenticate failed")?;
+    Ok(())
+}
+
+async fn report_success(
+    conn: &zbus::Connection,
+    uid: u32,
+    cookie: &str,
+    identity: (String, HashMap<String, OwnedValue>),
+) -> Result<()> {
+    let proxy = AuthorityProxy::new(conn).await?;
+    proxy
+        .authentication_agent_response2(uid, cookie, identity)
+        .await
+        .context("AuthenticationAgentResponse2 failed")?;
+    Ok(())
+}
+
+fn session_subject() -> Result<(String, HashMap<String, OwnedValue>)> {
+    let pid = std::process::id();
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    let start_time: u64 = stat
+        .split_whitespace()
+        .nth(21)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut props: HashMap<String, OwnedValue> = HashMap::new();
+    props.insert("pid".into(), OwnedValue::try_from(Value::U32(pid))?);
+    props.insert("start-time".into(), OwnedValue::try_from(Value::U64(start_time))?);
+
+    Ok(("unix-process".into(), props))
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
 
 const OBJECT_PATH: &str = "/org/deckery/PolicyKit1/AuthenticationAgent";
 
-/// Initiate a PAM authentication session for the given user and cookie.
-/// Responds to any PAM_PROMPT_ECHO_OFF or PAM_PROMPT_ECHO_ON prompt with
-/// the provided credential (password or PIN string).
-fn start_session(
-    username: String,
-    cookie: String,
-    credential: String,
-    task: gio::Task<String>,
-    window_id: Id,
-    sender: Arc<Mutex<Sender<Message>>>,
-) {
-    let user: UnixUser = UnixUser::new_for_name(&username).unwrap();
-    let session = AgentSession::new(&user, &cookie);
-    let sub_loop = glib::MainLoop::new(None, true);
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
 
-    let sub_loop_2 = sub_loop.clone();
-    let sender_clone = sender.clone();
+    let pending: CancelMap = Arc::new(Mutex::new(HashMap::new()));
 
-    session.connect_completed(move |session, success| {
-        unsafe {
-            if success {
-                task.clone().return_result(Ok("success".to_string()));
-                let _ = sender_clone
-                    .lock()
-                    .unwrap()
-                    .try_send(Message::AuthenticationSuccess(window_id));
-            } else {
-                task.clone().return_result(Err(glib::Error::new(
-                    glib::FileError::Failed,
-                    "Authentication failed",
-                )));
-                let _ = sender_clone
-                    .lock()
-                    .unwrap()
-                    .try_send(Message::AuthenticationFailed(
-                        window_id,
-                        "Authentication failed".to_string(),
-                    ));
-            }
-        }
-        session.cancel();
-        sub_loop_2.quit();
-    });
+    let conn = connection::Builder::session()?
+        .build()
+        .await
+        .context("failed to connect to session bus")?;
 
-    session.connect_show_info(|_session, info| {
-        println!("[polkit-agent] info: {info}");
-    });
+    let agent = DeckeryAgent {
+        conn: conn.clone(),
+        pending,
+    };
+    conn.object_server()
+        .at(OBJECT_PATH, agent)
+        .await
+        .context("failed to register agent object")?;
 
-    session.connect_show_error(|_session, error| {
-        eprintln!("[polkit-agent] error: {error}");
-    });
-
-    // Respond to any PAM prompt that expects hidden or visible input —
-    // pam_deckery.so sends "Deckery PIN: ", pam_unix.so sends "Password: ".
-    // We respond to both without checking the prompt string, so this works
-    // regardless of which module runs first in the polkit-1 PAM stack.
-    session.connect_request(move |session, _request, _echo_on| {
-        session.response(&credential);
-    });
-
-    session.initiate();
-    sub_loop.run();
-}
-
-pub fn main() -> Result<(), iced_layershell::Error> {
-    daemon(
-        DeckeryPolkitApp::namespace,
-        DeckeryPolkitApp::update,
-        DeckeryPolkitApp::view,
-        DeckeryPolkitApp::remove_id,
-    )
-    .subscription(DeckeryPolkitApp::subscription)
-    .settings(MainSettings {
-        layer_settings: LayerShellSettings {
-            start_mode: StartMode::Background,
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .run_with(DeckeryPolkitApp::new)
-}
-
-#[derive(Debug, Clone)]
-struct AuthSession {
-    users: Vec<String>,
-    selected_user: String,
-    cookie: String,
-    /// The credential currently typed into the input field (password or PIN).
-    credential: String,
-    error: Option<String>,
-    task: gio::Task<String>,
-    /// The message polkit sent (e.g. "Authentication is required to…").
-    message: String,
-    in_progress: bool,
-}
-
-#[derive(Debug, Default)]
-struct DeckeryPolkitApp {
-    sessions: BTreeMap<iced::window::Id, AuthSession>,
-    sender: Option<Arc<Mutex<Sender<Message>>>>,
-}
-
-#[to_layer_message(multi)]
-#[derive(Debug, Clone)]
-pub enum Message {
-    WindowClosed(iced::window::Id),
-    UserSelected(Id, String),
-    CredentialChanged(Id, String),
-    Authenticate(Id),
-    Cancel(Id),
-    NewSession(String, Vec<String>, gio::Task<String>, String, String),
-    Close(Id),
-    AuthenticationSuccess(Id),
-    /// Payload: (window_id, error_message). Allows retry — does not lock the UI.
-    AuthenticationFailed(Id, String),
-    IcedEvent(Event),
-    SetSender(Arc<Mutex<Sender<Message>>>),
-}
-
-impl DeckeryPolkitApp {
-    fn remove_id(&mut self, id: iced::window::Id) {
-        self.sessions.remove(&id);
-    }
-}
-
-impl DeckeryPolkitApp {
-    fn new() -> (Self, Command<Message>) {
-        (
-            Self {
-                sessions: BTreeMap::new(),
-                sender: None,
-            },
-            Command::none(),
+    let subject = session_subject().context("failed to build session subject")?;
+    let proxy = AuthorityProxy::new(&conn).await?;
+    proxy
+        .register_authentication_agent_with_options(
+            subject,
+            "en_US",
+            OBJECT_PATH,
+            HashMap::new(),
         )
-    }
+        .await
+        .context("failed to register with polkitd")?;
 
-    fn namespace(&self) -> String {
-        String::from("deckery-polkit-agent")
-    }
+    info!("deckery-polkit-agent registered at {OBJECT_PATH}");
 
-    fn subscription(&self) -> iced::Subscription<Message> {
-        iced::Subscription::batch(vec![
-            iced::Subscription::run(|| {
-                iced::stream::channel(100, |sender| {
-                    let sender = Arc::new(Mutex::new(sender));
-                    let sender_clone = sender.clone();
-
-                    std::thread::spawn(move || {
-                        let main_loop = glib::MainLoop::new(None, true);
-
-                        let listener = DeckeryListener::new(sender);
-
-                        let Ok(subject) = UnixSession::new_for_process_sync(
-                            nix::unistd::getpid().as_raw(),
-                            gio::Cancellable::NONE,
-                        ) else {
-                            eprintln!("[polkit-agent] failed to get session subject");
-                            return;
-                        };
-
-                        let Ok(_handle) = listener.register(
-                            RegisterFlags::NONE,
-                            &subject,
-                            OBJECT_PATH,
-                            gio::Cancellable::NONE,
-                        ) else {
-                            eprintln!("[polkit-agent] failed to register with polkitd — is another agent running?");
-                            return;
-                        };
-
-                        eprintln!("[polkit-agent] registered with polkitd");
-                        main_loop.run();
-                    });
-
-                    async move {
-                        let _ = sender_clone
-                            .lock()
-                            .unwrap()
-                            .try_send(Message::SetSender(sender_clone.clone()));
-                        futures::future::pending::<()>().await;
-                    }
-                })
-            }),
-            iced::window::close_events().map(Message::WindowClosed),
-            event::listen().map(Message::IcedEvent),
-        ])
-    }
-
-    fn update(&mut self, message: Message) -> Command<Message> {
-        match message {
-            Message::IcedEvent(event) => {
-                if let Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }) = event
-                {
-                    if let Some(id) = self.sessions.keys().next().cloned() {
-                        return Command::perform(async move { id }, Message::Cancel);
-                    }
-                }
-                Command::none()
-            }
-
-            Message::NewSession(cookie, users, task, message, _icon) => {
-                let id = iced::window::Id::unique();
-                let selected_user = users.first().cloned().unwrap_or_else(|| "root".to_string());
-                self.sessions.insert(
-                    id,
-                    AuthSession {
-                        users,
-                        selected_user,
-                        cookie,
-                        credential: String::new(),
-                        error: None,
-                        task,
-                        message,
-                        in_progress: false,
-                    },
-                );
-
-                Command::perform(async {}, move |_| Message::NewLayerShell {
-                    settings: NewLayerShellSettings {
-                        size: Some((600, 280)),
-                        anchor: Anchor::Right | Anchor::Top | Anchor::Left | Anchor::Bottom,
-                        layer: Layer::Overlay,
-                        use_last_output: false,
-                        ..Default::default()
-                    },
-                    id,
-                })
-            }
-
-            Message::UserSelected(id, user) => {
-                if let Some(session) = self.sessions.get_mut(&id) {
-                    session.selected_user = user;
-                }
-                Command::none()
-            }
-
-            Message::CredentialChanged(id, value) => {
-                if let Some(session) = self.sessions.get_mut(&id) {
-                    session.credential = value;
-                }
-                Command::none()
-            }
-
-            Message::Authenticate(id) => {
-                if let Some(session) = self.sessions.get_mut(&id) {
-                    if session.in_progress {
-                        return Command::none();
-                    }
-                    session.error = None;
-                    session.in_progress = true;
-
-                    let username = session.selected_user.clone();
-                    let cookie = session.cookie.clone();
-                    let credential = session.credential.clone();
-                    let task = session.task.clone();
-
-                    if let Some(sender) = self.sender.clone() {
-                        std::thread::spawn(move || {
-                            start_session(username, cookie, credential, task, id, sender);
-                        });
-                    }
-                }
-                Command::none()
-            }
-
-            Message::AuthenticationSuccess(id) => {
-                task::effect(Action::Window(WindowAction::Close(id)))
-            }
-
-            // On failure: clear credential, show error, allow retry.
-            Message::AuthenticationFailed(id, error) => {
-                if let Some(session) = self.sessions.get_mut(&id) {
-                    session.error = Some(error);
-                    session.in_progress = false;
-                    session.credential = String::new();
-                }
-                Command::none()
-            }
-
-            Message::Cancel(id) | Message::Close(id) => {
-                task::effect(Action::Window(WindowAction::Close(id)))
-            }
-
-            Message::SetSender(sender) => {
-                self.sender = Some(sender);
-                Command::none()
-            }
-
-            _ => Command::none(),
-        }
-    }
-
-    fn view(&self, id: iced::window::Id) -> Element<Message> {
-        let Some(session) = self.sessions.get(&id) else {
-            return Space::with_height(0).into();
-        };
-
-        let user_picker = pick_list(
-            session.users.clone(),
-            Some(session.selected_user.clone()),
-            move |s| Message::UserSelected(id, s),
-        );
-
-        let mut credential_input = text_input("Password or PIN", &session.credential)
-            .secure(true)
-            .style(|theme, status| {
-                let mut style = iced::widget::text_input::default(theme, status);
-                style.border.radius = iced::border::radius(8.0);
-                style
-            })
-            .on_input(move |s| Message::CredentialChanged(id, s))
-            .padding(10);
-
-        if !session.in_progress {
-            credential_input = credential_input.on_submit(Message::Authenticate(id));
-        }
-
-        let mut content = column![
-            column![
-                text(&session.message).size(20),
-                column![
-                    row![
-                        text("Authenticating as:").size(16),
-                        user_picker.text_size(16),
-                    ]
-                    .spacing(5)
-                    .align_y(Center),
-                    credential_input,
-                ]
-                .spacing(10),
-            ]
-            .spacing(20)
-            .padding(25),
-        ];
-
-        if let Some(error) = &session.error {
-            content = content.push(
-                text(format!("Authentication failed: {error}"))
-                    .size(14)
-                    .color(iced::Color::from_rgb(0.8, 0.0, 0.0))
-                    .center()
-                    .width(Fill),
-            );
-        }
-
-        let mut cancel_btn =
-            button(column![text("Cancel")].width(Fill).align_x(Center)).padding(13);
-        if !session.in_progress {
-            cancel_btn = cancel_btn.on_press(Message::Cancel(id));
-        }
-
-        let mut auth_btn =
-            button(column![text("Authenticate")].width(Fill).align_x(Center)).padding(13);
-        if !session.in_progress {
-            auth_btn = auth_btn.on_press(Message::Authenticate(id));
-        }
-
-        content = content.push(Space::with_height(Fill)).push(
-            row![cancel_btn, auth_btn]
-                .spacing(2)
-                .width(Fill)
-                .align_y(Bottom),
-        );
-
-        content.padding(1).height(Fill).into()
-    }
+    std::future::pending::<()>().await;
+    Ok(())
 }
