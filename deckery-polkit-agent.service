@@ -1,0 +1,19 @@
+[Unit]
+Description=Deckery polkit authentication agent
+Documentation=https://github.com/Plasma-Deckery/deckery-auth
+# Must start after the Wayland compositor is ready.
+# PartOf ensures the agent is stopped when the graphical session ends.
+After=graphical-session.target
+PartOf=graphical-session.target
+# Conflicts with the KDE built-in polkit agent — only one may run at a time.
+# The deploy script masks plasma-polkit-agent.service so this one wins.
+Conflicts=plasma-polkit-agent.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/deckery-polkit-agent
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

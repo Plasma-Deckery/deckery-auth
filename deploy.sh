@@ -104,6 +104,7 @@ PIN_SET_BIN="$SCRIPT_DIR/target/release/deckery-pin-set"
 PAM_TEST_BIN="$SCRIPT_DIR/target/release/deckery-pam-test"
 DAEMON_BIN_SRC="$SCRIPT_DIR/target/release/deckery-auth-daemon"
 UI_BIN_SRC="$SCRIPT_DIR/target/release/deckery-auth-ui"
+POLKIT_AGENT_BIN_SRC="$SCRIPT_DIR/target/release/deckery-polkit-agent"
 INSTALL_SCRIPT="$SCRIPT_DIR/configure-pam.sh"
 
 DEV_PAM_DIR="/usr/local/lib/security"
@@ -115,6 +116,9 @@ PIN_SET_BIN_INSTALL="/usr/local/bin/deckery-pin-set"
 UI_BIN_INSTALL="/usr/local/bin/deckery-auth-ui"
 UI_SERVICE_SRC="$SCRIPT_DIR/deckery-auth-ui.service"
 UI_SERVICE_INSTALL="/etc/systemd/user/deckery-auth-ui.service"
+POLKIT_AGENT_BIN_INSTALL="/usr/local/bin/deckery-polkit-agent"
+POLKIT_AGENT_SERVICE_SRC="$SCRIPT_DIR/deckery-polkit-agent.service"
+POLKIT_AGENT_SERVICE_INSTALL="/etc/systemd/user/deckery-polkit-agent.service"
 DECKERY_CONF_DIR="/etc/deckery"
 HASH_FILE="$DECKERY_CONF_DIR/pin.hash"
 HASH_BACKUP="$DECKERY_CONF_DIR/pin.hash.deploy-bak"
@@ -164,6 +168,32 @@ if [[ "$UNINSTALL" == true ]]; then
         echo "    (not present — skipped)"
     fi
 
+    echo "    stopping, disabling, and unmasking deckery-polkit-agent / plasma-polkit-agent"
+    if user_systemctl is-active --quiet deckery-polkit-agent 2>/dev/null; then
+        user_systemctl stop deckery-polkit-agent
+    fi
+    if user_systemctl is-enabled --quiet deckery-polkit-agent 2>/dev/null; then
+        user_systemctl disable deckery-polkit-agent
+    fi
+    if [[ -f "$POLKIT_AGENT_SERVICE_INSTALL" ]]; then
+        rm "$POLKIT_AGENT_SERVICE_INSTALL"
+        echo "    ✓ polkit agent service removed"
+    else
+        echo "    (polkit agent service not present — skipped)"
+    fi
+    # Unmask plasma-polkit-agent so KDE's agent can take over again.
+    user_systemctl unmask plasma-polkit-agent.service 2>/dev/null || true
+    echo "    ✓ plasma-polkit-agent.service unmasked"
+    user_systemctl daemon-reload
+
+    echo "    removing $POLKIT_AGENT_BIN_INSTALL"
+    if [[ -f "$POLKIT_AGENT_BIN_INSTALL" ]]; then
+        rm "$POLKIT_AGENT_BIN_INSTALL"
+        echo "    ✓ removed"
+    else
+        echo "    (not present — skipped)"
+    fi
+
     echo "    stopping and disabling deckery-auth-daemon"
     if systemctl is-active --quiet deckery-auth-daemon 2>/dev/null; then
         systemctl stop deckery-auth-daemon
@@ -205,17 +235,16 @@ fi
 
 # ── Build (runs as invoking user — distrobox/Podman are rootless) ─────────────
 
-# PAM, daemon, pin-set: built in the system/Rust distrobox (no Qt needed).
+# PAM, daemon, pin-set, polkit-agent: built in the system/Rust distrobox.
 # UI: built in the Qt distrobox (needs Qt 6.10+, lives in deckery-ui-build).
-# The polkit-agent is excluded — it's not yet functional and pulls in a zbus
-# version that requires a newer rustc than the deckery distrobox provides.
 
 if [[ "$INSTALL_PHASE" != "1" ]]; then
-    echo "==> Building PAM / daemon / pin-set (distrobox: $DISTROBOX)"
+    echo "==> Building PAM / daemon / pin-set / polkit-agent (distrobox: $DISTROBOX)"
     distrobox enter "$DISTROBOX" -- \
         cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml" \
         -p deckery-pam -p deckery-pam-test -p deckery-auth-daemon -p deckery-pin-set \
-        -p deckery-input --bin deckery-input-test
+        -p deckery-input --bin deckery-input-test \
+        -p deckery-polkit-agent
 
     echo ""
     echo "==> Building UI (distrobox: $DISTROBOX_UI)"
@@ -231,6 +260,7 @@ if [[ "$INSTALL_PHASE" != "1" ]]; then
         echo "      $PIN_SET_BIN"
         echo "      $DAEMON_BIN_SRC"
         echo "      $UI_BIN_SRC"
+        echo "      $POLKIT_AGENT_BIN_SRC"
         exit 0
     fi
 
@@ -459,6 +489,34 @@ echo "    cp deckery-pin-set -> $PIN_SET_BIN_INSTALL"
 install -m 755 "$PIN_SET_BIN" "$PIN_SET_BIN_INSTALL"
 echo "    ✓ installed"
 
+# ── Install deckery-polkit-agent ──────────────────────────────────────────────
+
+echo ""
+echo "==> Installing deckery-polkit-agent"
+
+# Stop before copying — running binary is locked on Linux.
+if user_systemctl is-active --quiet deckery-polkit-agent 2>/dev/null; then
+    echo "    stopping deckery-polkit-agent"
+    user_systemctl stop deckery-polkit-agent
+fi
+
+echo "    cp deckery-polkit-agent -> $POLKIT_AGENT_BIN_INSTALL"
+install -m 755 "$POLKIT_AGENT_BIN_SRC" "$POLKIT_AGENT_BIN_INSTALL"
+
+echo "    installing user service unit -> $POLKIT_AGENT_SERVICE_INSTALL"
+cp "$POLKIT_AGENT_SERVICE_SRC" "$POLKIT_AGENT_SERVICE_INSTALL"
+
+# Mask KDE's built-in polkit agent so only ours runs.
+echo "    masking plasma-polkit-agent.service"
+user_systemctl mask plasma-polkit-agent.service
+echo "    ✓ plasma-polkit-agent.service masked"
+
+user_systemctl daemon-reload
+
+echo "    enabling and starting deckery-polkit-agent"
+user_systemctl enable --now deckery-polkit-agent
+echo "    ✓ polkit agent running"
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -468,7 +526,8 @@ echo "    pam_deckery.so:        $DEV_PAM_SO"
 echo "    deckery-auth-daemon:   $DAEMON_BIN_INSTALL (system service, enabled)"
 echo "    deckery-auth-ui:       $UI_BIN_INSTALL (user service, enabled)"
 echo "    deckery-pin-set:       $PIN_SET_BIN_INSTALL"
-echo "    Active for:            /etc/pam.d/sudo"
+echo "    deckery-polkit-agent:  $POLKIT_AGENT_BIN_INSTALL (user service, enabled)"
+echo "    Active for:            /etc/pam.d/sudo, /etc/pam.d/polkit-1"
 echo ""
 echo "    Set your PIN (controller):  sudo deckery-pin-set"
 echo "    Set your PIN (keyboard):    sudo deckery-pin-set --keyboard"
@@ -476,3 +535,7 @@ echo ""
 echo "    Test controller PIN entry:"
 echo "    sudo systemctl status deckery-auth-daemon"
 echo "    (then trigger a sudo prompt and press buttons on the controller)"
+echo ""
+echo "    Test polkit auth:"
+echo "    pkexec id"
+echo "    (should show the deckery auth overlay)"
