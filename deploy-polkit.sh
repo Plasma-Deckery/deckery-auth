@@ -115,14 +115,6 @@ if [[ "$UNINSTALL" == true ]]; then
         echo "    (not present — skipped)"
     fi
 
-    echo "    removing /etc/pam.d/polkit-1 (deckery override)"
-    if [[ -f /etc/pam.d/polkit-1 ]]; then
-        rm /etc/pam.d/polkit-1
-        echo "    ✓ removed (falls back to /usr/lib/pam.d/polkit-1)"
-    else
-        echo "    (not present — skipped)"
-    fi
-
     echo ""
     echo "==> Uninstall complete. KDE polkit agent is active again."
     exit 0
@@ -157,24 +149,8 @@ install -m 755 "$POLKIT_AGENT_BIN_SRC" "$POLKIT_AGENT_BIN_INSTALL"
 echo "    installing service unit -> $POLKIT_AGENT_SERVICE_INSTALL"
 cp "$POLKIT_AGENT_SERVICE_SRC" "$POLKIT_AGENT_SERVICE_INSTALL"
 
-# polkit-1 PAM stack: pam_deckery.so before system-auth.
-# Written to /etc/pam.d/ so it survives package updates to /usr/lib/pam.d/.
-echo "    writing /etc/pam.d/polkit-1"
-if [[ ! -f /etc/pam.d/polkit-1 ]] || ! grep -q "pam_deckery.so" /etc/pam.d/polkit-1 2>/dev/null; then
-    cat > /etc/pam.d/polkit-1 <<EOF
-#%PAM-1.0
-# pam_deckery.so: controller PIN / keyboard password via deckery-auth-daemon.
-# Inserted by deploy-polkit.sh — remove with: ./deploy-polkit.sh --uninstall
-auth  [success=done authinfo_unavail=ignore auth_err=ignore default=die]  $DEV_PAM_SO  source=polkit-1
-auth       include      system-auth
-account    include      system-auth
-password   include      system-auth
-session    include      system-auth
-EOF
-    echo "    ✓ /etc/pam.d/polkit-1 written"
-else
-    echo "    (already present — skipped)"
-fi
+# No PAM stack change needed: the agent talks directly to deckery-auth-daemon
+# via /run/deckery/polkit.sock — no pam_deckery.so involved on the polkit path.
 
 # Mask KDE's built-in polkit agent so ours is the only one running.
 echo "    masking plasma-polkit-agent.service"
@@ -193,7 +169,7 @@ echo ""
 echo "==> Done."
 echo ""
 echo "    deckery-polkit-agent:  $POLKIT_AGENT_BIN_INSTALL (user service, enabled)"
-echo "    Active for:            /etc/pam.d/polkit-1"
+echo "    Socket:                /run/deckery/polkit.sock (0666, exe-verified)"
 echo ""
 echo "    Test:  pkexec id"
 echo "    Undo:  ./deploy-polkit.sh --uninstall"

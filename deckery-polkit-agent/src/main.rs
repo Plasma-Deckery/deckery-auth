@@ -1,19 +1,30 @@
 //! `deckery-polkit-agent` — thin polkit authentication agent.
 //!
 //! Registers with polkitd on D-Bus and forwards every `BeginAuthentication`
-//! request to the running `deckery-auth-daemon` via `pam_authenticate(3)`.
-//! pam_deckery.so (in the polkit-1 PAM stack) connects to the daemon socket;
-//! the existing `deckery-auth-ui` overlay handles all user interaction.
+//! request to the running `deckery-auth-daemon` over the auth socket.
+//! The daemon (running as root) handles all user interaction via
+//! `deckery-auth-ui` and verifies the credential internally — no PAM in
+//! this process.
+//!
+//! # Protocol
+//!
+//! ```text
+//! agent → daemon: "polkit-1:<username>\n"
+//! daemon → agent: "OK\n"     — auth succeeded
+//!              or "CANCEL\n" — user cancelled
+//!              or "ERROR:<msg>\n" — controller unavailable or other error
+//! ```
 //!
 //! No GUI lives in this binary — it is a pure relay.
 
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pam_client2::{Context as PamContext, Flag};
-use pam_client2::conv_null::Conversation as NullConv;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 use zbus::{connection, interface, proxy};
@@ -75,33 +86,38 @@ impl DeckeryAgent {
 
         info!("polkit auth: action={action_id} user={username}");
 
-        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         self.pending.lock().unwrap().insert(cookie.clone(), cancel_tx);
 
-        let conn = self.conn.clone();
+        let conn    = self.conn.clone();
         let pending = self.pending.clone();
         let identity = identities.into_iter().next().unwrap();
 
-        tokio::task::spawn_blocking(move || {
-            // Blocks until pam_deckery.so + daemon finish auth.
-            let pam_result = run_pam_auth("polkit-1", &username);
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                r = daemon_auth(&username) => r,
+                _ = cancel_rx => {
+                    info!("auth for {username} cancelled by polkit");
+                    Ok(false)
+                }
+            };
 
             pending.lock().unwrap().remove(&cookie);
 
-            if cancel_rx.try_recv().is_ok() {
-                info!("auth for {username} cancelled");
-                return;
-            }
-
-            match pam_result {
-                Ok(()) => {
-                    let rt = tokio::runtime::Handle::current();
-                    let _ = rt.block_on(async {
-                        report_success(&conn, uid, &cookie, identity).await
-                    });
+            match result {
+                Ok(true) => {
+                    info!("auth for {username}: daemon OK, reporting success");
+                    if let Err(e) = report_success(&conn, uid, &cookie, identity).await {
+                        warn!("auth for {username}: AuthenticationAgentResponse2 failed: {e:#?}");
+                    } else {
+                        info!("auth for {username}: AuthenticationAgentResponse2 accepted");
+                    }
+                }
+                Ok(false) => {
+                    info!("auth for {username}: cancelled or failed");
                 }
                 Err(e) => {
-                    info!("auth for {username} failed: {e}");
+                    warn!("auth for {username}: daemon error: {e:#}");
                 }
             }
         });
@@ -146,15 +162,47 @@ fn uid_to_name(uid: u32) -> Option<String> {
     Some(name.to_string_lossy().into_owned())
 }
 
-/// Call pam_authenticate for polkit-1. pam_deckery.so handles the actual
-/// interaction via the daemon — NullConversation is intentional (no prompts
-/// expected from pam_deckery.so; if daemon is down, auth fails cleanly).
-fn run_pam_auth(service: &str, username: &str) -> Result<()> {
-    let conv = NullConv::new();
-    let mut ctx = PamContext::new(service, Some(username), conv)
-        .context("pam_start failed")?;
-    ctx.authenticate(Flag::NONE).context("pam_authenticate failed")?;
-    Ok(())
+// ── daemon communication ──────────────────────────────────────────────────────
+
+const AUTH_SOCKET: &str = "/run/deckery/polkit.sock";
+/// Maximum time to wait for the daemon to complete authentication.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Connect to the auth daemon, send the polkit-1 request, and wait for the
+/// result.  Returns `Ok(true)` if auth succeeded, `Ok(false)` if cancelled,
+/// `Err` if the daemon is unreachable or responds unexpectedly.
+async fn daemon_auth(username: &str) -> Result<bool> {
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        UnixStream::connect(AUTH_SOCKET),
+    )
+    .await
+    .context("connect timeout")?
+    .context("connect to auth socket")?;
+
+    stream
+        .write_all(format!("polkit-1:{username}\n").as_bytes())
+        .await
+        .context("write source")?;
+
+    let mut line = String::new();
+    tokio::time::timeout(
+        AUTH_TIMEOUT,
+        BufReader::new(&mut stream).read_line(&mut line),
+    )
+    .await
+    .context("auth timeout")?
+    .context("read result")?;
+
+    match line.trim() {
+        "OK"     => Ok(true),
+        "CANCEL" => Ok(false),
+        other    => {
+            // ERROR:<msg> or unexpected — not fatal, just auth didn't succeed.
+            info!("daemon response: {other}");
+            Ok(false)
+        }
+    }
 }
 
 async fn report_success(
@@ -172,19 +220,16 @@ async fn report_success(
 }
 
 fn session_subject() -> Result<(String, HashMap<String, OwnedValue>)> {
-    let pid = std::process::id();
-    let stat = std::fs::read_to_string("/proc/self/stat")?;
-    let start_time: u64 = stat
-        .split_whitespace()
-        .nth(21)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let session_id = std::env::var("XDG_SESSION_ID")
+        .context("XDG_SESSION_ID not set")?;
 
     let mut props: HashMap<String, OwnedValue> = HashMap::new();
-    props.insert("pid".into(), OwnedValue::try_from(Value::U32(pid))?);
-    props.insert("start-time".into(), OwnedValue::try_from(Value::U64(start_time))?);
+    props.insert(
+        "session-id".into(),
+        OwnedValue::try_from(Value::Str(session_id.as_str().into()))?,
+    );
 
-    Ok(("unix-process".into(), props))
+    Ok(("unix-session".into(), props))
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -197,10 +242,10 @@ async fn main() -> Result<()> {
 
     let pending: CancelMap = Arc::new(Mutex::new(HashMap::new()));
 
-    let conn = connection::Builder::session()?
+    let conn = connection::Builder::system()?
         .build()
         .await
-        .context("failed to connect to session bus")?;
+        .context("failed to connect to system bus")?;
 
     let agent = DeckeryAgent {
         conn: conn.clone(),

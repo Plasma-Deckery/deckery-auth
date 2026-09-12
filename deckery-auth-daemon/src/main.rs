@@ -94,7 +94,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2, Params, Version,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -102,6 +102,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 
 use deckery_input::{ControlAction, Token, TokenReader, encode_sequence};
+
+// crypt(3) lives in libxcrypt on modern Fedora/Bazzite (libcrypt.so.2).
+// Not always re-exported by the `libc` crate — declared explicitly, linked
+// via build.rs (-lcrypt).
+extern "C" {
+    fn crypt(key: *const libc::c_char, salt: *const libc::c_char) -> *mut libc::c_char;
+}
 
 // ── PIN hash constants (shared with deckery-pin-set) ─────────────────────────
 
@@ -176,15 +183,25 @@ fn ipc_send(cmd: &str) {
     }
 }
 
-/// Root-only socket. PAM module connects here.
+/// Root-only socket (0600). pam_deckery.so connects here.
+/// Credential data (PIN, password) flows here — must stay 0600 forever.
 const AUTH_SOCKET_PATH: &str = "/run/deckery/auth.sock";
 
 /// Display socket. World-readable but peer-verified (see [`verify_display_peer`]).
 const DISPLAY_SOCKET_PATH: &str = "/run/deckery/display.sock";
 
+/// Polkit socket. World-readable, exe-verified. Only OK/CANCEL/ERROR flows
+/// here — no credential data. Separate from auth.sock so that stays 0600.
+const POLKIT_SOCKET_PATH: &str = "/run/deckery/polkit.sock";
+
 /// Only these binaries may receive display events.
 const DISPLAY_EXE_ALLOWLIST: &[&str] = &[
     "/usr/local/bin/deckery-auth-ui",
+];
+
+/// Only these binaries may connect to polkit.sock.
+const POLKIT_EXE_ALLOWLIST: &[&str] = &[
+    "/usr/local/bin/deckery-polkit-agent",
 ];
 
 // ── Attempt / verify channel types ───────────────────────────────────────────
@@ -307,16 +324,100 @@ fn verify_display_peer(stream: &tokio::net::UnixStream) -> bool {
     }
 }
 
+// ── Polkit socket peer verification ──────────────────────────────────────────
+
+/// Returns `true` if the connecting peer's executable is in `allowlist`.
+///
+/// Uses SO_PEERCRED → `/proc/<pid>/exe`.  Same pattern as
+/// [`verify_display_peer`] — defence-in-depth to prevent unrelated processes
+/// from triggering auth UI spam via the world-accessible polkit socket.
+fn verify_polkit_peer(stream: &UnixStream, allowlist: &[&str]) -> bool {
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        eprintln!("deckery-auth-daemon: SO_PEERCRED failed on polkit connect");
+        return false;
+    }
+    let pid = cred.pid;
+    let exe_link = format!("/proc/{pid}/exe");
+    match std::fs::read_link(&exe_link) {
+        Err(e) => {
+            eprintln!("deckery-auth-daemon: polkit peer check: cannot read {exe_link}: {e}");
+            false
+        }
+        Ok(path) => {
+            let path_str = path.to_string_lossy();
+            let exe = path_str.trim_end_matches(" (deleted)");
+            let allowed = allowlist.iter().any(|&entry| {
+                if exe == entry { return true; }
+                std::fs::canonicalize(entry)
+                    .map(|c| c.to_string_lossy() == exe)
+                    .unwrap_or(false)
+            });
+            if allowed {
+                eprintln!("deckery-auth-daemon: polkit accepted: {exe} (pid {pid})");
+            } else {
+                eprintln!("deckery-auth-daemon: polkit rejected: {exe} (pid {pid}) not in allowlist");
+            }
+            allowed
+        }
+    }
+}
+
+// ── Internal credential verification (used by the polkit self-verify path) ────
+//
+// The daemon runs as root and can therefore read /etc/deckery/pin.hash and call
+// getspnam(3).  This mirrors the verification logic in pam_deckery.so but lives
+// here so the polkit agent (a user-space process) does not need PAM at all.
+
+fn verify_pin_internal(encoded: &str) -> bool {
+    let stored = match std::fs::read_to_string(PIN_HASH_PATH) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return false,
+    };
+    if stored.is_empty() { return false; }
+    let parsed = match PasswordHash::new(&stored) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    Argon2::default().verify_password(encoded.as_bytes(), &parsed).is_ok()
+}
+
+fn verify_password_internal(username: &str, password: &str) -> bool {
+    use std::ffi::CString;
+    let uname = match CString::new(username) { Ok(s) => s, Err(_) => return false };
+    let pwd   = match CString::new(password)  { Ok(s) => s, Err(_) => return false };
+    unsafe {
+        let sp = libc::getspnam(uname.as_ptr());
+        if sp.is_null() { return false; }
+        let hash_ptr = (*sp).sp_pwdp;
+        if hash_ptr.is_null() { return false; }
+        let result = crypt(pwd.as_ptr(), hash_ptr);
+        if result.is_null() { return false; }
+        libc::strcmp(result, hash_ptr) == 0
+    }
+}
+
 // ── Priority table ────────────────────────────────────────────────────────────
 
 fn priority_for_source(source: &str) -> u8 {
     match source {
-        "greeter"     => 0,
-        "screenlock"  => 1,
-        "polkit"      => 2,
-        "sudo" | "su" => 3,
-        "login"       => 4,
-        _             => 10,
+        "greeter"          => 0,
+        "screenlock"       => 1,
+        "polkit" | "polkit-1" => 2,
+        "sudo" | "su"      => 3,
+        "login"            => 4,
+        _                  => 10,
     }
 }
 
@@ -383,6 +484,7 @@ async fn main() -> Result<()> {
     let _ = tokio::fs::remove_file(AUTH_SOCKET_PATH).await;
     let listener = UnixListener::bind(AUTH_SOCKET_PATH)
         .with_context(|| format!("bind {AUTH_SOCKET_PATH}"))?;
+    // 0600: credential data (PIN, password) flows here — root-only forever.
     std::fs::set_permissions(AUTH_SOCKET_PATH, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 600 {AUTH_SOCKET_PATH}"))?;
 
@@ -404,6 +506,9 @@ async fn main() -> Result<()> {
     ));
     tokio::spawn(display_accept_loop(
         display_tx.clone(), ui_cancel_tx, ui_password_tx, active_session,
+    ));
+    tokio::spawn(polkit_accept_loop(
+        queue.clone(), notify.clone(),
     ));
     auth_accept_loop(listener, queue, notify, display_tx).await;
 
@@ -522,14 +627,12 @@ async fn auth_accept_loop(
     }
 }
 
-/// Handles one connection on `auth.sock`.
+/// Handles one connection on `auth.sock` (root-only, 0600).
 ///
 /// Reads the first line to determine the request type:
-/// - `"SET_PIN"` → [`handle_set_pin`] (root-only, controller-based PIN setup)
-/// - anything else → treated as PAM source name and added to the auth queue
-///
-/// For the normal PAM flow the function mediates the multi-turn protocol
-/// between the socket (pam_deckery) and the worker (`collect_pin`):
+/// - `"SET_PIN"` → [`handle_set_pin`]
+/// - anything else → PAM relay: mediates the multi-turn CORRECT/WRONG protocol
+///   between pam_deckery.so and the worker.
 ///
 /// ```text
 /// worker ──AttemptMsg──► handle_incoming ──PIN:/KBD:/CANCEL/ERROR──► pam_deckery
@@ -563,8 +666,6 @@ async fn handle_incoming(
     let priority = priority_for_source(&source);
 
     // Create the two channels that connect this handler with the worker.
-    // handle_incoming keeps:  attempt_rx (reads attempts) + verify_tx (sends results)
-    // QueueEntry keeps:       attempt_tx (sends attempts) + verify_rx (reads results)
     let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel::<AttemptMsg>();
     let (verify_tx,      verify_rx ) = mpsc::unbounded_channel::<VerifyMsg>();
 
@@ -577,26 +678,19 @@ async fn handle_incoming(
 
     eprintln!("deckery-auth-daemon: queued '{source}' (priority {priority}) — {queue_len} request(s)");
 
-    // Split into owned halves so we can write and read concurrently without
-    // borrow conflicts.
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-
     let mut idle_buf = String::new();
+
     loop {
         // Wait for the next attempt from collect_pin, OR detect that pam_deckery
         // closed the connection (EOF/error on the read half while we're idle).
-        // In the idle state pam_deckery sends nothing, so any read result means
-        // the peer disconnected — drop channels so collect_pin can clean up.
         let msg = tokio::select! {
             msg = attempt_rx.recv() => match msg {
-                None      => break,   // collect_pin dropped sender — session over
+                None      => break,
                 Some(msg) => msg,
             },
             result = reader.read_line(&mut idle_buf) => {
-                // Ok(0) = EOF (pam_deckery died/timed out), Err = broken pipe.
-                // Either way: peer is gone. Dropping verify_tx here will cause
-                // collect_pin's verify_rx.recv() to return None → clean exit.
                 let _ = result;
                 eprintln!("deckery-auth-daemon: pam_deckery disconnected mid-session — cleaning up");
                 break;
@@ -635,9 +729,136 @@ async fn handle_incoming(
         let _ = verify_tx.send(result);
 
         if matches!(result, VerifyMsg::Correct) {
-            break;  // Done — worker will send Confirm+SessionEnd display events.
+            break;
         }
-        // Wrong → loop: wait for worker to send next AttemptMsg.
+    }
+}
+
+// ── Polkit socket ─────────────────────────────────────────────────────────────
+
+/// Accept loop for `polkit.sock` (0666, exe-verified).
+///
+/// This socket carries only `OK`/`CANCEL`/`ERROR` — no credential data.
+/// auth.sock stays 0600 (credential data flows there).
+async fn polkit_accept_loop(
+    queue:  Arc<Mutex<Queue>>,
+    notify: Arc<Notify>,
+) {
+    let _ = tokio::fs::remove_file(POLKIT_SOCKET_PATH).await;
+    let listener = match UnixListener::bind(POLKIT_SOCKET_PATH) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("deckery-auth-daemon: cannot bind polkit socket: {e}");
+            return;
+        }
+    };
+    let _ = std::fs::set_permissions(
+        POLKIT_SOCKET_PATH,
+        std::fs::Permissions::from_mode(0o666),
+    );
+    eprintln!("deckery-auth-daemon: polkit socket at {POLKIT_SOCKET_PATH} (exe-verified)");
+
+    loop {
+        match listener.accept().await {
+            Err(e) => eprintln!("deckery-auth-daemon: polkit accept error: {e}"),
+            Ok((stream, _)) => {
+                if !verify_polkit_peer(&stream, POLKIT_EXE_ALLOWLIST) { continue; }
+                tokio::spawn(handle_polkit_incoming(stream, queue.clone(), notify.clone()));
+            }
+        }
+    }
+}
+
+/// Handles one connection on `polkit.sock`.
+///
+/// Reads `"polkit-1:<username>\n"`, runs the auth session via the worker queue,
+/// and verifies the credential internally (daemon is root).
+///
+/// ```text
+/// agent → daemon: "polkit-1:<username>\n"
+/// worker ──Pin/Password──► handle_polkit_incoming ──verify internally
+/// worker ◄──Correct/Wrong──────────────────────────────────────────
+/// daemon → agent: "OK\n" | "CANCEL\n" | "ERROR:<msg>\n"
+/// ```
+async fn handle_polkit_incoming(
+    mut stream: UnixStream,
+    queue:      Arc<Mutex<Queue>>,
+    notify:     Arc<Notify>,
+) {
+    // Read the single source line: "polkit-1:<username>"
+    let source_line = {
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => {
+                let _ = stream.write_all(b"ERROR:read source\n").await;
+                return;
+            }
+            Ok(_) => line.trim().to_string(),
+        }
+    };
+
+    let username = match source_line.strip_prefix("polkit-1:") {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => {
+            eprintln!("deckery-auth-daemon: polkit socket: unexpected source '{source_line}'");
+            let _ = stream.write_all(b"ERROR:bad source\n").await;
+            return;
+        }
+    };
+
+    let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel::<AttemptMsg>();
+    let (verify_tx,      verify_rx ) = mpsc::unbounded_channel::<VerifyMsg>();
+
+    let queue_len = {
+        let mut q = queue.lock().await;
+        q.push("polkit-1".to_string(), attempt_tx, verify_rx);
+        q.len()
+    };
+    notify.notify_one();
+
+    eprintln!("deckery-auth-daemon: queued 'polkit-1' for user '{username}' — {queue_len} request(s)");
+
+    let (_, mut write_half) = stream.into_split();
+
+    loop {
+        let msg = match attempt_rx.recv().await {
+            None      => break,
+            Some(msg) => msg,
+        };
+        match msg {
+            AttemptMsg::Cancel => {
+                let _ = write_half.write_all(b"CANCEL\n").await;
+                break;
+            }
+            AttemptMsg::Error(e) => {
+                let _ = write_half.write_all(format!("ERROR:{e}\n").as_bytes()).await;
+                break;
+            }
+            AttemptMsg::Pin(encoded) => {
+                let encoded2 = encoded.clone();
+                let ok = tokio::task::spawn_blocking(move || verify_pin_internal(&encoded2))
+                    .await
+                    .unwrap_or(false);
+                let _ = verify_tx.send(if ok { VerifyMsg::Correct } else { VerifyMsg::Wrong });
+                if ok {
+                    let _ = write_half.write_all(b"OK\n").await;
+                    break;
+                }
+                // Wrong → collect_pin shows ✗, waits for retry.
+            }
+            AttemptMsg::Password(pwd) => {
+                let uname = username.clone();
+                let ok = tokio::task::spawn_blocking(move || verify_password_internal(&uname, &pwd))
+                    .await
+                    .unwrap_or(false);
+                let _ = verify_tx.send(if ok { VerifyMsg::Correct } else { VerifyMsg::Wrong });
+                if ok {
+                    let _ = write_half.write_all(b"OK\n").await;
+                    break;
+                }
+            }
+        }
     }
 }
 
